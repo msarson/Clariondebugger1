@@ -65,8 +65,9 @@ public partial class MainWindow : Window
             CmbModule.ItemsSource = withLines;
             _suppressModuleEvent = false;
 
-            LstProcs.ItemsSource = _info.Procedures.OrderBy(p => p.Rva)
-                                        .Select(p => $"{p.Name}  @0x{p.Rva:X}").ToList();
+            _allProcs = _info.Procedures.OrderBy(p => p.Name)
+                             .Select(p => new ProcItem(p.Name, p.Rva)).ToList();
+            FilterProcs("");
             Log($"Loaded {Path.GetFileName(path)} — {_info.ModuleCount} modules " +
                 $"({withLines.Count} with debug lines), {_info.Lines.Count} line entries, " +
                 $"{_info.Procedures.Count} procedures.");
@@ -226,7 +227,39 @@ public partial class MainWindow : Window
         ClearCurrentLine(); SetState(State.Idle); Status("Stopped.");
     }
 
-    void LstProcs_SelectionChanged(object sender, System.Windows.Controls.SelectionChangedEventArgs e) { }
+    List<ProcItem> _allProcs = new();
+
+    void FilterProcs(string text)
+    {
+        IEnumerable<ProcItem> items = _allProcs;
+        if (!string.IsNullOrWhiteSpace(text))
+            items = _allProcs.Where(p => p.Name.Contains(text, StringComparison.OrdinalIgnoreCase));
+        LstProcs.ItemsSource = items.Take(500).ToList();
+    }
+
+    void TxtProcFilter_TextChanged(object sender, System.Windows.Controls.TextChangedEventArgs e)
+        => FilterProcs(TxtProcFilter.Text);
+
+    void LstProcs_SelectionChanged(object sender, System.Windows.Controls.SelectionChangedEventArgs e)
+    {
+        if (_info == null || LstProcs.SelectedItem is not ProcItem p) return;
+        var loc = _info.Locate(p.Rva);   // entry RVA -> (module, line)
+        if (loc is not { } l) { Log($"{p.Name}: no source line for entry 0x{p.Rva:X}."); return; }
+        if (l.Module != _curModule)
+        {
+            _suppressModuleEvent = true;
+            CmbModule.SelectedItem = l.Module;
+            _suppressModuleEvent = false;
+            ShowModule(l.Module);
+        }
+        var sl = _lines.FirstOrDefault(x => x.LineNo == l.Line);
+        if (sl != null)
+        {
+            SourceList.UpdateLayout();
+            ((FrameworkElement?)SourceList.ItemContainerGenerator.ContainerFromItem(sl))?.BringIntoView();
+        }
+        Status($"{p.Name} → {l.Module}:{l.Line}. Click the gutter there to set a breakpoint.");
+    }
 
     // ---------- helpers ----------
     void ClearCurrentLine() { foreach (var l in _lines) if (l.IsCurrent) l.IsCurrent = false; }
@@ -264,6 +297,14 @@ public sealed class SourceLine : INotifyPropertyChanged
 
     public event PropertyChangedEventHandler? PropertyChanged;
     void Raise(string p) => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(p));
+}
+
+public sealed class ProcItem
+{
+    public string Name { get; }
+    public uint Rva { get; }
+    public ProcItem(string name, uint rva) { Name = name; Rva = rva; }
+    public override string ToString() => $"{Name}  @0x{Rva:X}";
 }
 
 public sealed class VarRow

@@ -42,9 +42,14 @@
                     <RowDefinition Height="*"/>
                 </Grid.RowDefinitions>
                 <DockPanel Grid.Row="0">
-                    <TextBlock DockPanel.Dock="Top" Text="PROCEDURES" Style="{StaticResource Header}"/>
+                    <TextBlock DockPanel.Dock="Top" Text="PROCEDURES (click to open source)" Style="{StaticResource Header}"/>
+                    <TextBox x:Name="TxtProcFilter" DockPanel.Dock="Top" Margin="8,0,8,4" Padding="4,2"
+                             Background="{StaticResource PanelAlt}" Foreground="{StaticResource Fg}"
+                             BorderBrush="{StaticResource Border}" FontFamily="Consolas" FontSize="12"
+                             TextChanged="TxtProcFilter_TextChanged"
+                             ToolTip="Type to filter, e.g. BrowseStudents"/>
                     <ListBox x:Name="LstProcs" Background="Transparent" Foreground="{StaticResource Fg}"
-                             BorderThickness="0" FontFamily="Consolas" FontSize="13"
+                             BorderThickness="0" FontFamily="Consolas" FontSize="12"
                              SelectionChanged="LstProcs_SelectionChanged"/>
                 </DockPanel>
                 <DockPanel Grid.Row="1">
