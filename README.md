@@ -33,7 +33,9 @@ ABC application — `School`, 54 modules):
 - **Source-line breakpoints** — click the gutter; they snap to the nearest executable line.
 - **Multi-module** — parses the whole TSWD module table; pick any of the app's `.clw`
   modules, with source resolution that also finds the Clarion `libsrc` sources.
-- **Searchable Procedures list** — filter across all procedures and click to jump to source.
+- **Searchable Procedures list** — filter across all procedures (text + a "kind" pulldown:
+  your global procedures, ThisWindow/Report local methods, or any specific class's methods)
+  and click to jump to source.
 - **Call stack with per-frame locals** — click any frame to inspect *its* locals; the
   selected frame stays put across steps.
 - **Locals & Globals** — full enumeration (incl. threaded ABC procedures via scope-grouping),

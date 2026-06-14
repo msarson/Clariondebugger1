@@ -46,6 +46,9 @@
                 </Grid.RowDefinitions>
                 <DockPanel Grid.Row="0">
                     <TextBlock DockPanel.Dock="Top" Text="PROCEDURES (click to open source)" Style="{StaticResource Header}"/>
+                    <ComboBox x:Name="CmbProcCat" DockPanel.Dock="Top" Margin="8,0,8,3" FontFamily="Consolas"
+                              FontSize="11" SelectionChanged="CmbProcCat_SelectionChanged"
+                              ToolTip="Show only a kind of procedure"/>
                     <TextBox x:Name="TxtProcFilter" DockPanel.Dock="Top" Margin="8,0,8,4" Padding="4,2"
                              Background="{StaticResource PanelAlt}" Foreground="{StaticResource Fg}"
                              BorderBrush="{StaticResource Border}" FontFamily="Consolas" FontSize="12"

@@ -85,6 +85,7 @@ public partial class MainWindow : Window
 
             _allProcs = _info.Procedures.OrderBy(p => p.Name)
                              .Select(p => new ProcItem(p.Name, p.Rva)).ToList();
+            BuildProcCategories();    // populate the kind pulldown (sets _procGroup = null)
             FilterProcs("");
             BuildSourceTypeIndex();   // read declared types from the .clw sources
             Log($"Loaded {Path.GetFileName(path)} — {_info.ModuleCount} modules " +
@@ -275,17 +276,72 @@ public partial class MainWindow : Window
     void BtnStepOut_Click(object sender, RoutedEventArgs e) => Step(_session!.StepOut, "Step out");
 
     List<ProcItem> _allProcs = new();
+    string? _procGroup;            // null = all kinds
+    bool _suppressCatEvent;
+
+    const string KeyLocal = "\x01Local";       // aggregate: ThisWindow/ThisReport/... methods
+    const string KeyClasses = "\x01Classes";   // aggregate: all other (ABC/library) class methods
+    static bool IsLocalClass(string g) => g.StartsWith("THIS", StringComparison.OrdinalIgnoreCase);
 
     void FilterProcs(string text)
     {
         IEnumerable<ProcItem> items = _allProcs;
+        if (_procGroup != null)
+            items = _procGroup switch
+            {
+                KeyLocal => items.Where(p => IsLocalClass(p.Group)),
+                KeyClasses => items.Where(p => p.Group != ProcItem.App && p.Group != ProcItem.Runtime && !IsLocalClass(p.Group)),
+                _ => items.Where(p => p.Group == _procGroup)
+            };
         if (!string.IsNullOrWhiteSpace(text))
-            items = _allProcs.Where(p => p.Name.Contains(text, StringComparison.OrdinalIgnoreCase));
-        LstProcs.ItemsSource = items.Take(500).ToList();
+            items = items.Where(p => p.Name.Contains(text, StringComparison.OrdinalIgnoreCase));
+        LstProcs.ItemsSource = items.Take(1000).ToList();
     }
 
     void TxtProcFilter_TextChanged(object sender, System.Windows.Controls.TextChangedEventArgs e)
         => FilterProcs(TxtProcFilter.Text);
+
+    // pulldown of procedure kinds, built from what's actually in the app (App / each class / runtime)
+    sealed class CatItem
+    {
+        public string? Key { get; }
+        readonly string _label; readonly int _count;
+        public CatItem(string label, string? key, int count) { _label = label; Key = key; _count = count; }
+        public override string ToString() => $"{_label}  ({_count})";
+    }
+
+    void BuildProcCategories()
+    {
+        var counts = _allProcs.GroupBy(p => p.Group).ToDictionary(g => g.Key, g => g.Count());
+        int total = _allProcs.Count;
+        int app = counts.GetValueOrDefault(ProcItem.App);
+        int rt = counts.GetValueOrDefault(ProcItem.Runtime);
+        int local = _allProcs.Count(p => IsLocalClass(p.Group));
+        int other = total - app - rt - local;
+
+        // aggregate filters first, then a drill-down entry per class (sorted by count)
+        var items = new List<CatItem> { new("All procedures", null, total) };
+        if (app > 0) items.Add(new("Global procedures (yours)", ProcItem.App, app));
+        if (local > 0) items.Add(new("Local methods (ThisWindow/Report)", KeyLocal, local));
+        if (other > 0) items.Add(new("Other class methods (ABC)", KeyClasses, other));
+        if (rt > 0) items.Add(new("Routines / thunks", ProcItem.Runtime, rt));
+        foreach (var kv in counts.Where(kv => kv.Key != ProcItem.App && kv.Key != ProcItem.Runtime)
+                                  .OrderByDescending(kv => kv.Value).ThenBy(kv => kv.Key))
+            items.Add(new("   " + kv.Key, kv.Key, kv.Value));
+
+        _suppressCatEvent = true;
+        CmbProcCat.ItemsSource = items;
+        CmbProcCat.SelectedIndex = 0;
+        _suppressCatEvent = false;
+        _procGroup = null;
+    }
+
+    void CmbProcCat_SelectionChanged(object sender, System.Windows.Controls.SelectionChangedEventArgs e)
+    {
+        if (_suppressCatEvent) return;
+        _procGroup = (CmbProcCat.SelectedItem as CatItem)?.Key;
+        FilterProcs(TxtProcFilter.Text);
+    }
 
     void LstProcs_SelectionChanged(object sender, System.Windows.Controls.SelectionChangedEventArgs e)
     {
@@ -494,10 +550,33 @@ public sealed class FrameRow
 
 public sealed class ProcItem
 {
+    public const string App = "\x01App";        // free procedures you wrote
+    public const string Runtime = "\x01Runtime";// thunks / generated routines
+
     public string Name { get; }
     public uint Rva { get; }
-    public ProcItem(string name, uint rva) { Name = name; Rva = rva; }
+    public string Group { get; }                // App, Runtime, or the owning class name (THISWINDOW, BROWSECLASS, …)
+    public ProcItem(string name, uint rva) { Name = name; Rva = rva; Group = GroupOf(name); }
     public override string ToString() => $"{Name}  @0x{Rva:X}";
+
+    /// <summary>
+    /// The procedure's group: <see cref="App"/> for a free procedure (NAME@F with no class, e.g.
+    /// BROWSESTUDENTS@F), the owning class name for a method (THISWINDOW from ASK@F10THISWINDOW,
+    /// BROWSECLASS from UPDATETHUMB@F11BROWSECLASS), or <see cref="Runtime"/> for thunks/routines.
+    /// </summary>
+    public static string GroupOf(string name)
+    {
+        if (name.StartsWith("__") || name.Contains("$$$") || name.StartsWith("R$") || name.Contains("@_"))
+            return Runtime;
+        int i = name.IndexOf("@F", StringComparison.Ordinal);
+        if (i < 0) return Runtime;
+        string rest = name[(i + 2)..];
+        if (rest.Length == 0 || !char.IsDigit(rest[0])) return App;     // free procedure (no SELF class)
+        int d = 0; while (d < rest.Length && char.IsDigit(rest[d])) d++;
+        if (int.TryParse(rest[..d], out int len) && len > 0 && d + len <= rest.Length)
+            return rest.Substring(d, len);                              // the owning class name
+        return Runtime;
+    }
 }
 
 public sealed class VarRow : INotifyPropertyChanged
