@@ -4,15 +4,28 @@ Reverse-engineered from Clarion 12 debug builds (`vid=full`). This documents the
 and type records inside the `TSWD` blob (see `FINDINGS.md` for the blob locator/header).
 Verified end-to-end: every type below reads correct live values from a running debuggee.
 
-## Blob directory (dwords at blob+8)
+## Blob header + directory
 
-| idx | meaning |
+```
+blob+0  'TSWD'
+blob+4  u32 moduleCount        (1 for single-file programs; 54 for the School ABC app)
+blob+8  directory: 12 u32 stream offsets (relative to blob start)
+```
+
+| dir idx | meaning |
 |----|---------|
-| 1 | source-file name offset |
-| 3 / 4 | line table offset / entry count |
+| 0 | module name-offset array: `moduleCount` × u32 (offsets into dir[1]) |
+| 1 | module name string table (`ABBROWSE.CLW\0SCHOOL.clw\0…`) |
+| 2 | per-module line ranges: `moduleCount` × `{ u32 firstLineIdx; u32 lastLineIdx }` (`{0,0}`=no lines) |
+| 3 / 4 | line table offset / total entry count |
 | 6 | name string-table base (`NB`) |
 | 8 | symbol-record stream base (`SB`) |
 | 10 / 11 | address-map count / offset (`AM`) |
+
+**Multi-module**: every module's lines live in the one flat line table; `dir[2]` gives each
+module its `[firstLineIdx, lastLineIdx]` slice. So an RVA → `(module, line)` by finding the
+line entry with the greatest rva ≤ target and reading back which module's slice owns it.
+(Single-file programs are just `moduleCount==1`.)
 
 **Line table**: `{ u16 line; u32 rva }` × count.
 **Address map**: `{ u32 rva; u32 ref }` × count — the top-level symbols (globals + procs).

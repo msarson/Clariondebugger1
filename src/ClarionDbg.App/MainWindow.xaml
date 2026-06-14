@@ -62,7 +62,14 @@
                     <RowDefinition Height="Auto"/>
                     <RowDefinition Height="*"/>
                 </Grid.RowDefinitions>
-                <TextBlock x:Name="TxtSourceName" Grid.Row="0" Text="(no source)" Style="{StaticResource Header}"/>
+                <DockPanel Grid.Row="0" Margin="8,4">
+                    <TextBlock DockPanel.Dock="Left" Text="MODULE" Foreground="{StaticResource FgDim}"
+                               FontSize="11" FontWeight="SemiBold" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                    <ComboBox x:Name="CmbModule" Width="220" DockPanel.Dock="Left" FontFamily="Consolas"
+                              FontSize="12" SelectionChanged="CmbModule_SelectionChanged"/>
+                    <TextBlock x:Name="TxtSourceName" Text="(no source)" Foreground="{StaticResource FgDim}"
+                               FontSize="11" VerticalAlignment="Center" Margin="12,0,0,0"/>
+                </DockPanel>
                 <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto">
                     <ItemsControl x:Name="SourceList">
                         <ItemsControl.ItemTemplate>

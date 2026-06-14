@@ -79,8 +79,11 @@ MSBuild.exe sample/dbgtest/dbgtest.cwproj /p:Configuration=Debug `
 - [x] Decode the TSWD **type records** fully → typed vars, GROUP layout, arrays, strings, decimals.
 - [x] **Local variables & params** (EBP-relative) for the procedure in scope.
 - [x] Proper module attribution for call-stack frames outside the debuggee module.
+- [x] **Multi-module ABC apps** — parse the module table; map RVA ↔ (module, line) across
+      all modules; module picker in the UI; source resolution incl. Clarion `libsrc`.
 - [ ] Stepping: step over / into / out (line granularity).
 - [ ] Per-frame locals (select a stack frame → show its locals using that frame's EBP).
+- [ ] Robust global-data symbols for multi-module apps (currently filtered/partial).
 - [ ] Edit-variable-at-runtime (`WriteProcessMemory`), watch expressions, conditional BPs.
 - [ ] STRING/CSTRING/PSTRING distinction; DATE/TIME calendar formatting.
 - [ ] Disassembly + memory windows, threads list.

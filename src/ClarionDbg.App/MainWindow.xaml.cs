@@ -18,7 +18,10 @@ public partial class MainWindow : Window
     TswdInfo? _info;
     DebugSession? _session;
     State _state = State.Idle;
-    string? _exePath, _srcPath;
+    string? _exePath;
+    string? _curModule;
+    bool _suppressModuleEvent;
+    readonly HashSet<(string Module, int Line)> _breaks = new();
 
     readonly ObservableCollection<SourceLine> _lines = new();
     readonly ObservableCollection<VarRow> _vars = new();
@@ -32,9 +35,11 @@ public partial class MainWindow : Window
         GridLocals.ItemsSource = _localsRows;
         Loaded += (_, _) =>
         {
-            // auto-load the sample for an immediate demo
-            var sample = @"C:\ai\debuger\sample\dbgtest\dbgtest_dbg.exe";
-            if (File.Exists(sample)) LoadExe(sample);
+            // optional: open an EXE passed on the command line, else the bundled sample
+            var args = Environment.GetCommandLineArgs();
+            var target = args.Length > 1 && File.Exists(args[1]) ? args[1]
+                       : @"C:\ai\debuger\sample\dbgtest\dbgtest_dbg.exe";
+            if (File.Exists(target)) LoadExe(target);
         };
     }
 
@@ -50,59 +55,92 @@ public partial class MainWindow : Window
         try
         {
             _exePath = path;
+            _breaks.Clear();
             _pe = new PeImage(path);
             _info = TswdInfo.Load(_pe);
             if (_info == null) { Log("No .cwdebug info — this EXE was not built in Debug mode (vid=full)."); return; }
 
-            _srcPath = ResolveSource(path, _info.SourceFile);
-            TxtSourceName.Text = _srcPath ?? _info.SourceFile;
-            LoadSource();
+            var withLines = _info.Modules.Where(m => m.Lines.Count > 0).Select(m => m.Name).ToList();
+            _suppressModuleEvent = true;
+            CmbModule.ItemsSource = withLines;
+            _suppressModuleEvent = false;
+
             LstProcs.ItemsSource = _info.Procedures.OrderBy(p => p.Rva)
                                         .Select(p => $"{p.Name}  @0x{p.Rva:X}").ToList();
+            Log($"Loaded {Path.GetFileName(path)} — {_info.ModuleCount} modules " +
+                $"({withLines.Count} with debug lines), {_info.Lines.Count} line entries, " +
+                $"{_info.Procedures.Count} procedures.");
 
-            Log($"Loaded {Path.GetFileName(path)} — {_info.Lines.Count} line entries, " +
-                $"{_info.Globals.Count} globals, {_info.Procedures.Count} procedures.");
-            // pre-set a demonstration breakpoint where all globals are populated
-            SetBreakpointAtLine(21);
-            Status($"Loaded {Path.GetFileName(path)}. Press Go to run.");
+            // show the program's primary module
+            string primary = !string.IsNullOrEmpty(_info.SourceFile) ? _info.SourceFile : withLines.FirstOrDefault() ?? "";
+            CmbModule.SelectedItem = primary;     // triggers ShowModule
+            if (_info.ModuleCount == 1 && primary.Equals("dbgtest.clw", StringComparison.OrdinalIgnoreCase))
+                ToggleBreak(21);                  // demo breakpoint for the bundled sample
+            Status($"Loaded {Path.GetFileName(path)}. Pick a module, set breakpoints, press Go.");
         }
         catch (Exception ex) { Log("Load error: " + ex.Message); }
     }
 
-    string? ResolveSource(string exePath, string srcName)
+    void CmbModule_SelectionChanged(object sender, System.Windows.Controls.SelectionChangedEventArgs e)
     {
-        foreach (var dir in new[] { Path.GetDirectoryName(exePath)!,
-                                    @"C:\ai\debuger\sample\dbgtest" })
+        if (_suppressModuleEvent) return;
+        if (CmbModule.SelectedItem is string name) ShowModule(name);
+    }
+
+    void ShowModule(string moduleName)
+    {
+        _curModule = moduleName;
+        string? src = ResolveSource(moduleName);
+        TxtSourceName.Text = src ?? "(source file not found)";
+        _lines.Clear();
+        if (src == null) { Log($"Source not found for {moduleName} (searched exe dir + Clarion libsrc)."); return; }
+        int n = 1;
+        foreach (var line in File.ReadAllLines(src))
         {
-            var p = Path.Combine(dir, srcName);
+            var sl = new SourceLine { LineNo = n, Text = line.Replace("\t", "    ") };
+            sl.HasBreakpoint = _breaks.Contains((moduleName, n));
+            _lines.Add(sl);
+            n++;
+        }
+    }
+
+    static readonly string[] SourceSearchDirs =
+    {
+        @"C:\Clarion12\libsrc\win", @"C:\Clarion1213999\libsrc\win",
+        @"C:\Clarion12\accessory\libsrc\win"
+    };
+
+    string? ResolveSource(string moduleName)
+    {
+        var dirs = new List<string>();
+        if (_exePath != null)
+        {
+            var d = Path.GetDirectoryName(_exePath)!;
+            dirs.Add(d);
+            dirs.Add(Path.GetDirectoryName(d) ?? d);   // project dir often one above the bin
+        }
+        dirs.AddRange(SourceSearchDirs);
+        foreach (var dir in dirs)
+        {
+            var p = Path.Combine(dir, moduleName);
             if (File.Exists(p)) return p;
         }
         return null;
     }
 
-    void LoadSource()
-    {
-        _lines.Clear();
-        if (_srcPath == null) { Log("Source file not found next to EXE."); return; }
-        int n = 1;
-        foreach (var line in File.ReadAllLines(_srcPath))
-            _lines.Add(new SourceLine { LineNo = n++, Text = line.Replace("\t", "    ") });
-    }
-
     // ---------- breakpoints ----------
     void Gutter_Click(object sender, MouseButtonEventArgs e)
     {
-        if (sender is FrameworkElement fe && fe.Tag is SourceLine sl)
-        {
-            sl.HasBreakpoint = !sl.HasBreakpoint;
-            Log(sl.HasBreakpoint ? $"Breakpoint set at line {sl.LineNo}." : $"Breakpoint cleared at line {sl.LineNo}.");
-        }
+        if (sender is FrameworkElement fe && fe.Tag is SourceLine sl) ToggleBreak(sl.LineNo);
     }
 
-    void SetBreakpointAtLine(int line)
+    void ToggleBreak(int line)
     {
+        if (_curModule == null) return;
+        var key = (_curModule, line);
         var sl = _lines.FirstOrDefault(l => l.LineNo == line);
-        if (sl != null) sl.HasBreakpoint = true;
+        if (_breaks.Remove(key)) { if (sl != null) sl.HasBreakpoint = false; Log($"Breakpoint cleared at {_curModule}:{line}."); }
+        else { _breaks.Add(key); if (sl != null) sl.HasBreakpoint = true; Log($"Breakpoint set at {_curModule}:{line}."); }
     }
 
     // ---------- run control ----------
@@ -112,8 +150,7 @@ public partial class MainWindow : Window
         if (_state == State.Running) return;
         if (_pe == null || _info == null || _exePath == null) { Log("Open a debug EXE first."); return; }
 
-        var bpLines = _lines.Where(l => l.HasBreakpoint).Select(l => l.LineNo).ToList();
-        if (bpLines.Count == 0) { Log("Set at least one breakpoint (click the gutter)."); return; }
+        if (_breaks.Count == 0) { Log("Set at least one breakpoint (click the gutter)."); return; }
 
         _vars.Clear(); _localsRows.Clear(); LstStack.ItemsSource = null;
         _session = new DebugSession(_exePath, _pe, _info);
@@ -124,7 +161,7 @@ public partial class MainWindow : Window
             Log($"--- debuggee exited (code {code}) ---");
             ClearCurrentLine(); SetState(State.Idle); Status("Exited.");
         });
-        _session.Start(bpLines);
+        _session.Start(_breaks.Select(b => new DebugSession.Breakpoint(b.Module, b.Line)));
         SetState(State.Running);
         Status("Running…");
     }
@@ -132,7 +169,16 @@ public partial class MainWindow : Window
     void OnStopped(DebugSession.StopInfo info) => Dispatcher.Invoke(() =>
     {
         SetState(State.Stopped);
-        Log($"Stopped: {info.Reason} at EIP 0x{info.Eip:X8}" + (info.Line is int l ? $" (line {l})" : ""));
+        Log($"Stopped: {info.Reason} at {info.Module}:{info.Line} (EIP 0x{info.Eip:X8})");
+
+        // switch the source view to the module we stopped in
+        if (info.Module != null && info.Module != _curModule)
+        {
+            _suppressModuleEvent = true;
+            CmbModule.SelectedItem = info.Module;
+            _suppressModuleEvent = false;
+            ShowModule(info.Module);
+        }
 
         ClearCurrentLine();
         if (info.Line is int line)
@@ -143,7 +189,7 @@ public partial class MainWindow : Window
         }
 
         LstStack.ItemsSource = info.Stack.Select((f, i) =>
-            $"#{i} {f.Proc}  0x{f.Addr:X8}" + (f.Line is int fl ? $"  line {fl}" : "")).ToList();
+            $"#{i} {f.Proc}  0x{f.Addr:X8}" + (f.Line is int fl ? $"  {f.Module}:{fl}" : "")).ToList();
 
         _localsRows.Clear();
         foreach (var v in info.Locals)

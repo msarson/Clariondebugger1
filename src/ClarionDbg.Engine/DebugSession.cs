@@ -5,9 +5,10 @@ namespace ClarionDbg.Engine;
 
 public sealed class DebugSession
 {
-    public record Frame(string Proc, uint Addr, int? Line);
+    public record Breakpoint(string? Module, int Line);
+    public record Frame(string Proc, uint Addr, string? Module, int? Line);
     public record VarValue(string Name, uint Addr, string TypeName, string Display);
-    public record StopInfo(uint Eip, int? Line, IReadOnlyList<Frame> Stack,
+    public record StopInfo(uint Eip, string? Module, int? Line, IReadOnlyList<Frame> Stack,
                            IReadOnlyList<VarValue> Globals, IReadOnlyList<VarValue> Locals, string Reason);
 
     public event Action<StopInfo>? Stopped;
@@ -32,11 +33,11 @@ public sealed class DebugSession
     public DebugSession(string exePath, PeImage pe, TswdInfo info)
     { _exePath = exePath; _pe = pe; _info = info; }
 
-    public IReadOnlyList<int> RequestedBreakLines { get; private set; } = Array.Empty<int>();
+    public IReadOnlyList<Breakpoint> RequestedBreaks { get; private set; } = Array.Empty<Breakpoint>();
 
-    public void Start(IEnumerable<int> breakLines)
+    public void Start(IEnumerable<Breakpoint> breaks)
     {
-        RequestedBreakLines = breakLines.ToList();
+        RequestedBreaks = breaks.ToList();
         _worker = new Thread(Run) { IsBackground = true, Name = "ClarionDbg" };
         _worker.Start();
     }
@@ -141,25 +142,25 @@ public sealed class DebugSession
 
     void ArmBreakpoints()
     {
-        foreach (int line in RequestedBreakLines)
+        foreach (var bp in RequestedBreaks)
         {
-            var rva = _info.LineToRva(line);
-            if (rva is not uint r) { Log?.Invoke($"No code for line {line}."); continue; }
+            var rva = _info.LineToRva(bp.Line, bp.Module);
+            if (rva is not uint r) { Log?.Invoke($"No code for {bp.Module}:{bp.Line}."); continue; }
             uint va = _base + r;
-            byte orig = ReadByte(va);
-            _breakpoints[va] = orig;
+            if (_breakpoints.ContainsKey(va)) continue;
+            _breakpoints[va] = ReadByte(va);
             WriteByte(va, 0xCC);
-            Log?.Invoke($"Breakpoint armed: line {line} @ 0x{va:X8}");
+            Log?.Invoke($"Breakpoint armed: {bp.Module}:{bp.Line} @ 0x{va:X8}");
         }
     }
 
     void ReportStop(Native.CONTEXT ctx, string reason)
     {
         uint eipRva = ctx.Eip - _base;
-        int? line = _info.RvaToLine(eipRva);
+        var loc = _info.Locate(eipRva);
 
         // EBP call-stack walk
-        var stack = new List<Frame> { new(FrameLabel(eipRva, ctx.Eip), ctx.Eip, line) };
+        var stack = new List<Frame> { new(FrameLabel(eipRva, ctx.Eip), ctx.Eip, loc?.Module, loc?.Line) };
         uint ebp = ctx.Ebp;
         for (int i = 0; i < 32 && ebp != 0; i++)
         {
@@ -167,8 +168,8 @@ public sealed class DebugSession
             uint nextEbp = ReadDword(ebp);
             if (retAddr == 0) break;
             uint rRva = retAddr - _base;
-            stack.Add(new Frame(FrameLabel(rRva, retAddr), retAddr,
-                                _pe.IsCodeRva(rRva) ? _info.RvaToLine(rRva) : null));
+            var floc = _pe.IsCodeRva(rRva) ? _info.Locate(rRva) : null;
+            stack.Add(new Frame(FrameLabel(rRva, retAddr), retAddr, floc?.Module, floc?.Line));
             if (nextEbp <= ebp) break;
             ebp = nextEbp;
         }
@@ -191,7 +192,7 @@ public sealed class DebugSession
                 locals.Add(new VarValue(lv.Name, va, lv.Type.Describe(), lv.Type.Format(ReadBytes(va, Math.Max(lv.Type.Size, 1)))));
             }
 
-        Stopped?.Invoke(new StopInfo(ctx.Eip, line, stack, globals, locals, reason));
+        Stopped?.Invoke(new StopInfo(ctx.Eip, loc?.Module, loc?.Line, stack, globals, locals, reason));
     }
 
     string FrameLabel(uint rva, uint absAddr)
