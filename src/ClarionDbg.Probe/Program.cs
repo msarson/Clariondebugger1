@@ -20,13 +20,13 @@ sess.Stopped += info2 =>
 {
     Console.WriteLine($"\n*** STOPPED: {info2.Reason} at EIP 0x{info2.Eip:X8} (line {info2.Line}) ***");
     Console.WriteLine("call stack:");
-    foreach (var f in info2.Stack) Console.WriteLine($"   {f.Proc,-12} 0x{f.Addr:X8} line {f.Line}");
-    Console.WriteLine("globals (live values read from the debuggee):");
+    foreach (var f in info2.Stack) Console.WriteLine($"   {f.Proc,-20} 0x{f.Addr:X8} {(f.Line is int l ? "line " + l : "")}");
+    Console.WriteLine("locals (current procedure):");
+    foreach (var v in info2.Locals)
+        Console.WriteLine($"   {v.Name,-18} {v.TypeName,-14} = {v.Display}");
+    Console.WriteLine("globals (typed, live values):");
     foreach (var v in info2.Globals)
-    {
-        string ascii = new string(v.Raw.Select(b => b >= 32 && b < 127 ? (char)b : '.').ToArray());
-        Console.WriteLine($"   {v.Name,-10} @0x{v.Addr:X8}  long={(int)v.AsLong,-6} ascii='{ascii}'  {v.Hex}");
-    }
+        Console.WriteLine($"   {v.Name,-12} {v.TypeName,-14} = {v.Display}");
     Console.WriteLine("\n(continuing…)");
     sess.Continue();
 };

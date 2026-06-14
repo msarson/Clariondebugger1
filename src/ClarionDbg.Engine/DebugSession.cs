@@ -6,13 +6,9 @@ namespace ClarionDbg.Engine;
 public sealed class DebugSession
 {
     public record Frame(string Proc, uint Addr, int? Line);
-    public record VarValue(string Name, uint Addr, byte[] Raw)
-    {
-        public uint AsLong => Raw.Length >= 4 ? BinaryPrimitives.ReadUInt32LittleEndian(Raw) : 0;
-        public string Hex => "0x" + BitConverter.ToString(Raw).Replace("-", "");
-    }
+    public record VarValue(string Name, uint Addr, string TypeName, string Display);
     public record StopInfo(uint Eip, int? Line, IReadOnlyList<Frame> Stack,
-                           IReadOnlyList<VarValue> Globals, string Reason);
+                           IReadOnlyList<VarValue> Globals, IReadOnlyList<VarValue> Locals, string Reason);
 
     public event Action<StopInfo>? Stopped;
     public event Action<int>? Exited;
@@ -162,34 +158,47 @@ public sealed class DebugSession
         uint eipRva = ctx.Eip - _base;
         int? line = _info.RvaToLine(eipRva);
 
-        // basic EBP call-stack walk
-        var stack = new List<Frame>();
-        stack.Add(new Frame(NearestProc(eipRva), ctx.Eip, line));
+        // EBP call-stack walk
+        var stack = new List<Frame> { new(FrameLabel(eipRva, ctx.Eip), ctx.Eip, line) };
         uint ebp = ctx.Ebp;
-        for (int i = 0; i < 16 && ebp != 0; i++)
+        for (int i = 0; i < 32 && ebp != 0; i++)
         {
             uint retAddr = ReadDword(ebp + 4);
             uint nextEbp = ReadDword(ebp);
-            if (retAddr == 0 || retAddr < _base) break;
+            if (retAddr == 0) break;
             uint rRva = retAddr - _base;
-            stack.Add(new Frame(NearestProc(rRva), retAddr, _info.RvaToLine(rRva)));
+            stack.Add(new Frame(FrameLabel(rRva, retAddr), retAddr,
+                                _pe.IsCodeRva(rRva) ? _info.RvaToLine(rRva) : null));
             if (nextEbp <= ebp) break;
             ebp = nextEbp;
         }
 
+        // globals (typed)
         var globals = new List<VarValue>();
         foreach (var g in _info.Globals.OrderBy(g => g.Rva))
-            globals.Add(new VarValue(g.Name, _base + g.Rva, ReadBytes(_base + g.Rva, 8)));
+        {
+            uint va = _base + g.Rva;
+            globals.Add(new VarValue(g.Name, va, g.Type.Describe(), g.Type.Format(ReadBytes(va, Math.Max(g.Type.Size, 1)))));
+        }
 
-        Stopped?.Invoke(new StopInfo(ctx.Eip, line, stack, globals, reason));
+        // locals of the procedure we stopped in (EBP-relative)
+        var locals = new List<VarValue>();
+        var proc = _info.ProcContaining(eipRva);
+        if (proc != null)
+            foreach (var lv in proc.Locals.OrderBy(l => l.FrameOffset))
+            {
+                uint va = (uint)((long)ctx.Ebp + lv.FrameOffset);
+                locals.Add(new VarValue(lv.Name, va, lv.Type.Describe(), lv.Type.Format(ReadBytes(va, Math.Max(lv.Type.Size, 1)))));
+            }
+
+        Stopped?.Invoke(new StopInfo(ctx.Eip, line, stack, globals, locals, reason));
     }
 
-    string NearestProc(uint rva)
+    string FrameLabel(uint rva, uint absAddr)
     {
-        string name = "?"; uint best = 0;
-        foreach (var p in _info.Procedures)
-            if (p.Rva <= rva && p.Rva >= best) { best = p.Rva; name = p.Name; }
-        return name;
+        if (!_pe.IsCodeRva(rva)) return $"[runtime]  0x{absAddr:X8}";
+        var p = _info.ProcContaining(rva);
+        return p != null ? p.Name : $"0x{absAddr:X8}";
     }
 
     // ---- process memory helpers ----

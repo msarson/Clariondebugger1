@@ -5,24 +5,30 @@ A clean, modern replacement for the crash-prone debugger built into Clarion. It 
 `TSWD` debug information and driving the process with the standard **Win32 Debugging API** —
 no dependency on the proprietary `D32` engine.
 
-## Status — Milestone 1: vertical slice ✅ (proven)
+## Status — Milestones 1 & 2 ✅ (proven)
 
-The full pipeline works end-to-end against a real debuggee:
+The full pipeline works end-to-end against a real debuggee, with a **complete typed view**:
 
 ```
-launch dbgtest_dbg.exe  ->  break at dbgtest.clw:21  ->  read live variables  ->  continue
-GBLCOUNT = 5            PERSON.Age = 42 ("Robe"rto)
-GBLNAME  = "Hello Cl"(arion)   GBLPRICE = 19.99 (BCD)
+break inside Compute()  ->  typed locals + call stack + typed globals
+LOCIDX int32 = 1→2   LOCSUM int32 = 0→1   PCOUNT int32 = 5      (EBP-relative locals)
+call stack: COMPUTE → _main:21 → [runtime]
+PERSON group = {AGE=42, PERSONNAME='Roberto'}   GBLPRICE decimal = 19.99
+VARRAY int32[4] = [11,22,0,0]   VREAL real8 = 6.28318   VDEC = 12.34   VPDEC = 5.678
 ```
 
 - Launches the debuggee (`CreateProcess(DEBUG_ONLY_THIS_PROCESS)`), uses the **runtime**
   image base (ASLR-safe).
 - Software breakpoints (`0xCC`) mapped from **source line → address** via the TSWD line table.
-- On hit: rewinds EIP, reads registers (`GetThreadContext`), walks the EBP call stack,
-  and reads **live global values** from process memory.
-- Re-arms breakpoints via single-step; resume / terminate.
+- On hit: rewinds EIP, reads registers (`GetThreadContext`), walks the EBP call stack
+  (runtime frames labeled `[runtime]`), re-arms via single-step; resume / terminate.
+- **Full TSWD type system** (`TSWD_FORMAT.md`): int/uint/float/char, DECIMAL & PDECIMAL
+  (packed BCD), STRING/CSTRING/PSTRING, arrays, and nested GROUPs — all formatted from
+  live process memory.
+- **Typed locals & parameters** read via EBP + frame offset for the procedure in scope.
 - WPF UI (professional dark theme): source view with breakpoint gutter + current-line
-  highlight, Procedures, Call Stack, Globals/Variables grid, output log.
+  highlight, Procedures, Call Stack, **Locals** + **Globals** grids (name/type/value),
+  output log.
 
 ## How Clarion debug mode works (reverse-engineered)
 
@@ -70,12 +76,13 @@ MSBuild.exe sample/dbgtest/dbgtest.cwproj /p:Configuration=Debug `
 
 ## Roadmap
 
-- [ ] Decode the TSWD **type-byte records** fully → typed locals, params, GROUP layout,
-      arrays, strings, decimals, references.
-- [ ] **Local variables** (EBP-relative) from frame info; per-frame variable view.
+- [x] Decode the TSWD **type records** fully → typed vars, GROUP layout, arrays, strings, decimals.
+- [x] **Local variables & params** (EBP-relative) for the procedure in scope.
+- [x] Proper module attribution for call-stack frames outside the debuggee module.
 - [ ] Stepping: step over / into / out (line granularity).
-- [ ] Proper module attribution for call-stack frames outside the debuggee module.
+- [ ] Per-frame locals (select a stack frame → show its locals using that frame's EBP).
 - [ ] Edit-variable-at-runtime (`WriteProcessMemory`), watch expressions, conditional BPs.
+- [ ] STRING/CSTRING/PSTRING distinction; DATE/TIME calendar formatting.
 - [ ] Disassembly + memory windows, threads list.
 - [ ] DLL debug info (`.cwdebug` in DLLs), multi-module programs.
 ```

@@ -22,12 +22,14 @@ public partial class MainWindow : Window
 
     readonly ObservableCollection<SourceLine> _lines = new();
     readonly ObservableCollection<VarRow> _vars = new();
+    readonly ObservableCollection<VarRow> _localsRows = new();
 
     public MainWindow()
     {
         InitializeComponent();
         SourceList.ItemsSource = _lines;
         GridVars.ItemsSource = _vars;
+        GridLocals.ItemsSource = _localsRows;
         Loaded += (_, _) =>
         {
             // auto-load the sample for an immediate demo
@@ -113,7 +115,7 @@ public partial class MainWindow : Window
         var bpLines = _lines.Where(l => l.HasBreakpoint).Select(l => l.LineNo).ToList();
         if (bpLines.Count == 0) { Log("Set at least one breakpoint (click the gutter)."); return; }
 
-        _vars.Clear(); LstStack.ItemsSource = null;
+        _vars.Clear(); _localsRows.Clear(); LstStack.ItemsSource = null;
         _session = new DebugSession(_exePath, _pe, _info);
         _session.Log += s => Dispatcher.Invoke(() => Log(s));
         _session.Stopped += OnStopped;
@@ -143,21 +145,16 @@ public partial class MainWindow : Window
         LstStack.ItemsSource = info.Stack.Select((f, i) =>
             $"#{i} {f.Proc}  0x{f.Addr:X8}" + (f.Line is int fl ? $"  line {fl}" : "")).ToList();
 
+        _localsRows.Clear();
+        foreach (var v in info.Locals)
+            _localsRows.Add(new VarRow { Name = v.Name, Type = v.TypeName, Value = v.Display, Address = $"0x{v.Addr:X8}" });
+
         _vars.Clear();
         foreach (var v in info.Globals)
-            _vars.Add(new VarRow { Name = v.Name, Value = FormatValue(v), Address = $"0x{v.Addr:X8}" });
+            _vars.Add(new VarRow { Name = v.Name, Type = v.TypeName, Value = v.Display, Address = $"0x{v.Addr:X8}" });
 
         Status($"Stopped at line {info.Line}. Press Go to continue.");
     });
-
-    static string FormatValue(DebugSession.VarValue v)
-    {
-        var sb = new StringBuilder();
-        sb.Append((int)v.AsLong);
-        var ascii = new string(v.Raw.Select(b => b >= 32 && b < 127 ? (char)b : '·').ToArray());
-        sb.Append("   '").Append(ascii).Append('\'');
-        return sb.ToString();
-    }
 
     void BtnStop_Click(object sender, RoutedEventArgs e)
     {
@@ -208,6 +205,7 @@ public sealed class SourceLine : INotifyPropertyChanged
 public sealed class VarRow
 {
     public string Name { get; set; } = "";
+    public string Type { get; set; } = "";
     public string Value { get; set; } = "";
     public string Address { get; set; } = "";
 }
