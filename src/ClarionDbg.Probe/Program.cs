@@ -55,11 +55,14 @@ sess.Exited += c => { Console.WriteLine($"[exit] code {c}"); done.Set(); };
 sess.Stopped += info2 =>
 {
     Console.WriteLine($"\n*** STOPPED: {info2.Reason} at EIP 0x{info2.Eip:X8} ({info2.Module}:{info2.Line}) ***");
-    Console.WriteLine("call stack:");
-    foreach (var f in info2.Stack) Console.WriteLine($"   {f.Proc,-20} 0x{f.Addr:X8} {(f.Line is int l ? f.Module + ":" + l : "")}");
-    Console.WriteLine("locals (current procedure):");
-    foreach (var v in info2.Locals)
-        Console.WriteLine($"   {v.Name,-18} {v.TypeName,-14} = {v.Display}");
+    Console.WriteLine("call stack + per-frame locals:");
+    int fi = 0;
+    foreach (var f in info2.Stack)
+    {
+        Console.WriteLine($"  #{fi++} {f.Proc,-28} {(f.Line is int l ? f.Module + ":" + l : "")}  [{f.Locals.Count} locals]");
+        foreach (var v in f.Locals.Take(6))
+            Console.WriteLine($"        {v.Name,-22} {v.TypeName,-8} = {v.Display}");
+    }
     Console.WriteLine("globals (typed, live values):");
     foreach (var v in info2.Globals)
         Console.WriteLine($"   {v.Name,-12} {v.TypeName,-14} = {v.Display}");

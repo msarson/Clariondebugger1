@@ -6,7 +6,7 @@ namespace ClarionDbg.Engine;
 public sealed class DebugSession
 {
     public record Breakpoint(string? Module, int Line);
-    public record Frame(string Proc, uint Addr, string? Module, int? Line);
+    public record Frame(string Proc, uint Addr, string? Module, int? Line, IReadOnlyList<VarValue> Locals);
     public record VarValue(string Name, uint Addr, string TypeName, string Display);
     public record StopInfo(uint Eip, string? Module, int? Line, IReadOnlyList<Frame> Stack,
                            IReadOnlyList<VarValue> Globals, IReadOnlyList<VarValue> Locals, string Reason);
@@ -159,17 +159,15 @@ public sealed class DebugSession
         uint eipRva = ctx.Eip - _base;
         var loc = _info.Locate(eipRva);
 
-        // EBP call-stack walk
-        var stack = new List<Frame> { new(FrameLabel(eipRva, ctx.Eip), ctx.Eip, loc?.Module, loc?.Line) };
+        // EBP call-stack walk — each frame carries its own locals (read at that frame's EBP)
+        var stack = new List<Frame> { MakeFrame(ctx.Eip, ctx.Ebp) };
         uint ebp = ctx.Ebp;
         for (int i = 0; i < 32 && ebp != 0; i++)
         {
             uint retAddr = ReadDword(ebp + 4);
             uint nextEbp = ReadDword(ebp);
             if (retAddr == 0) break;
-            uint rRva = retAddr - _base;
-            var floc = _pe.IsCodeRva(rRva) ? _info.Locate(rRva) : null;
-            stack.Add(new Frame(FrameLabel(rRva, retAddr), retAddr, floc?.Module, floc?.Line));
+            stack.Add(MakeFrame(retAddr, nextEbp));   // caller frame: address = return addr, base = saved EBP
             if (nextEbp <= ebp) break;
             ebp = nextEbp;
         }
@@ -179,18 +177,27 @@ public sealed class DebugSession
         foreach (var g in _info.Globals)
             globals.Add(ReadVar(g.Name, _base + g.Rva, g.Type, g.DisplaySize, g.Threaded));
 
-        // locals of the procedure we stopped in (EBP-relative)
-        var locals = new List<VarValue>();
-        var proc = _info.ProcContaining(eipRva);
-        if (proc != null)
-            foreach (var lv in proc.Locals)
-            {
-                uint va = lv.IsStatic ? _base + lv.Rva : (uint)((long)ctx.Ebp + lv.FrameOffset);
-                int sz = lv.Type.Size > 0 ? lv.Type.Size : 4;
-                locals.Add(ReadVar(lv.Name, va, lv.Type, sz, lv.Threaded));
-            }
+        Stopped?.Invoke(new StopInfo(ctx.Eip, loc?.Module, loc?.Line, stack, globals, stack[0].Locals, reason));
+    }
 
-        Stopped?.Invoke(new StopInfo(ctx.Eip, loc?.Module, loc?.Line, stack, globals, locals, reason));
+    Frame MakeFrame(uint addr, uint frameEbp)
+    {
+        uint rva = addr - _base;
+        bool code = _pe.IsCodeRva(rva);
+        var l = code ? _info.Locate(rva) : null;
+        var locals = new List<VarValue>();
+        if (code)
+        {
+            var proc = _info.ProcContaining(rva);
+            if (proc != null)
+                foreach (var lv in proc.Locals)
+                {
+                    uint va = lv.IsStatic ? _base + lv.Rva : (uint)((long)frameEbp + lv.FrameOffset);
+                    int sz = lv.Type.Size > 0 ? lv.Type.Size : lv.DisplaySize;
+                    locals.Add(ReadVar(lv.Name, va, lv.Type, sz, lv.Threaded));
+                }
+        }
+        return new Frame(FrameLabel(rva, addr), addr, l?.Module, l?.Line, locals);
     }
 
     VarValue ReadVar(string name, uint va, ClaType type, int size, bool threaded = false)

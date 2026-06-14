@@ -53,9 +53,10 @@
                              SelectionChanged="LstProcs_SelectionChanged"/>
                 </DockPanel>
                 <DockPanel Grid.Row="1">
-                    <TextBlock DockPanel.Dock="Top" Text="CALL STACK" Style="{StaticResource Header}"/>
+                    <TextBlock DockPanel.Dock="Top" Text="CALL STACK (click a frame for its locals)" Style="{StaticResource Header}"/>
                     <ListBox x:Name="LstStack" Background="Transparent" Foreground="{StaticResource Fg}"
-                             BorderThickness="0" FontFamily="Consolas" FontSize="12"/>
+                             BorderThickness="0" FontFamily="Consolas" FontSize="12"
+                             SelectionChanged="LstStack_SelectionChanged"/>
                 </DockPanel>
             </Grid>
 

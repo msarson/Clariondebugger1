@@ -202,17 +202,8 @@ public partial class MainWindow : Window
                 ((FrameworkElement?)SourceList.ItemContainerGenerator.ContainerFromItem(sl))?.BringIntoView(); }
         }
 
-        LstStack.ItemsSource = info.Stack.Select((f, i) =>
-            $"#{i} {f.Proc}  0x{f.Addr:X8}" + (f.Line is int fl ? $"  {f.Module}:{fl}" : "")).ToList();
-
-        // make the procedure we stopped in obvious — its name + module
-        var top = info.Stack.FirstOrDefault();
-        string proc = top?.Proc ?? "?";
-        TxtLocalsHeader.Text = $"LOCALS — {proc}" + (info.Module != null ? $"  ({info.Module}:{info.Line})" : "");
-
-        _localsRows.Clear();
-        foreach (var v in info.Locals)
-            _localsRows.Add(new VarRow { Name = v.Name, Type = v.TypeName, Value = v.Display, Address = $"0x{v.Addr:X8}" });
+        LstStack.ItemsSource = info.Stack.Select((f, i) => new FrameRow(i, f)).ToList();
+        LstStack.SelectedIndex = 0;   // triggers ShowFrameLocals for the innermost frame
 
         _vars.Clear();
         foreach (var v in info.Globals)
@@ -220,6 +211,29 @@ public partial class MainWindow : Window
 
         Status($"Stopped at line {info.Line}. Press Go to continue.");
     });
+
+    void LstStack_SelectionChanged(object sender, System.Windows.Controls.SelectionChangedEventArgs e)
+    {
+        if (LstStack.SelectedItem is not FrameRow fr) return;
+        var f = fr.Frame;
+        TxtLocalsHeader.Text = $"LOCALS — {f.Proc}" + (f.Line is int ln ? $"  ({f.Module}:{ln})" : "");
+        _localsRows.Clear();
+        foreach (var v in f.Locals)
+            _localsRows.Add(new VarRow { Name = v.Name, Type = v.TypeName, Value = v.Display, Address = $"0x{v.Addr:X8}" });
+        // jump the source view to the selected frame's line
+        if (f.Module != null && f.Line is int fl)
+        {
+            if (f.Module != _curModule)
+            {
+                _suppressModuleEvent = true; CmbModule.SelectedItem = f.Module; _suppressModuleEvent = false;
+                ShowModule(f.Module);
+            }
+            ClearCurrentLine();
+            var sl = _lines.FirstOrDefault(x => x.LineNo == fl);
+            if (sl != null) { sl.IsCurrent = true; SourceList.UpdateLayout();
+                ((FrameworkElement?)SourceList.ItemContainerGenerator.ContainerFromItem(sl))?.BringIntoView(); }
+        }
+    }
 
     void BtnStop_Click(object sender, RoutedEventArgs e)
     {
@@ -297,6 +311,15 @@ public sealed class SourceLine : INotifyPropertyChanged
 
     public event PropertyChangedEventHandler? PropertyChanged;
     void Raise(string p) => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(p));
+}
+
+public sealed class FrameRow
+{
+    public DebugSession.Frame Frame { get; }
+    readonly int _i;
+    public FrameRow(int i, DebugSession.Frame f) { _i = i; Frame = f; }
+    public override string ToString() =>
+        $"#{_i} {Frame.Proc}  0x{Frame.Addr:X8}" + (Frame.Line is int l ? $"  {Frame.Module}:{l}" : "");
 }
 
 public sealed class ProcItem
