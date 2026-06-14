@@ -6,3 +6,4 @@ map/
 sample/**/obj/
 sample/**/map/
 sample/dbgtest/dbgtest.exe
+run/
