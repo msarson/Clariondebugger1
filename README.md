@@ -100,8 +100,12 @@ MSBuild.exe sample/dbgtest/dbgtest.cwproj /p:Configuration=Debug `
       at EBP+offset (verified). Types for ABC class/file locals still show as sized hex+ASCII.
 - [x] **Breakpoints snap to the nearest executable line** and report when moved (clicking a
       declaration line no longer silently jumps into an unrelated procedure).
+- [x] **Per-frame locals** — each call-stack frame carries its own locals (read at that
+      frame's EBP); click a frame to see them. Essential for ABC, where you often break in a
+      `ThisWindow.Init`/method and the window-proc locals live a few frames up.
+- [x] **Searchable, click-to-navigate Procedures list** — filter by name, click to open the
+      procedure's source ready to set a breakpoint.
 - [ ] Stepping: step over / into / out (line granularity).
-- [ ] Per-frame locals (select a stack frame → show its locals using that frame's EBP).
 - [ ] Clarion ROUTINE frame sharing (routines reuse the parent procedure's locals).
 - [ ] Edit-variable-at-runtime (`WriteProcessMemory`), watch expressions, conditional BPs.
 - [ ] STRING/CSTRING/PSTRING distinction; DATE/TIME calendar formatting.
