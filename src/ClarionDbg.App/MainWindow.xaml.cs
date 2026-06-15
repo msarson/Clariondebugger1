@@ -21,6 +21,17 @@ public partial class MainWindow : Window
     State _state = State.Idle;
     string? _exePath;
     string? _curModule;
+
+    // ---- multi-DLL: the EXE plus any sibling Clarion debug DLLs, and the source-module catalog ----
+    sealed record LoadedImage(string Path, string Name, PeImage Pe, TswdInfo Info);
+    readonly List<LoadedImage> _images = new();                                   // EXE first, then debug DLLs
+    readonly Dictionary<string, (TswdInfo Info, string Image)> _modOwners = new(StringComparer.OrdinalIgnoreCase); // .clw -> owning blob
+    readonly List<string> _moduleNames = new();                                   // every source module, EXE modules first
+    readonly List<string> _siblingDlls = new();                                   // debug DLL paths to PreloadModule onto the session
+
+    /// <summary>The TSWD blob that owns a source module (the EXE's, a DLL's, or the EXE as fallback).</summary>
+    TswdInfo? InfoFor(string? module)
+        => module != null && _modOwners.TryGetValue(module, out var ms) ? ms.Info : _info;
     bool _suppressModuleEvent;
     string? _stickyFrame;          // keep this procedure selected in the call stack across steps
     bool _suppressStackSource;     // re-selecting a frame on stop shouldn't move the source off the execution line
@@ -86,25 +97,28 @@ public partial class MainWindow : Window
             _info = TswdInfo.Load(_pe);
             if (_info == null) { Log("No .cwdebug info — this EXE was not built in Debug mode (vid=full)."); return; }
 
-            var withLines = _info.Modules.Where(m => m.Lines.Count > 0).Select(m => m.Name).ToList();
+            DiscoverImages(path);     // EXE + sibling Clarion debug DLLs -> _images / _modOwners / _moduleNames
+
             _suppressModuleEvent = true;
-            CmbModule.ItemsSource = withLines;
+            CmbModule.ItemsSource = _moduleNames.ToList();
             _suppressModuleEvent = false;
 
-            _allProcs = _info.Procedures.OrderBy(p => p.Name)
-                             .Select(p => new ProcItem(p.Name, p.Rva)).ToList();
+            _allProcs = _images.SelectMany(img => img.Info.Procedures
+                                   .Select(p => new ProcItem(p.Name, p.Rva, img.Info, img.Name)))
+                               .OrderBy(p => p.Name).ToList();
             BuildProcCategories();    // populate the kind pulldown (sets _procGroup = null)
             FilterProcs("");
             BuildSourceTypeIndex();   // read declared types from the .clw sources
-            Log($"Loaded {Path.GetFileName(path)} — {_info.ModuleCount} modules " +
-                $"({withLines.Count} with debug lines), {_info.Lines.Count} line entries, " +
-                $"{_info.Procedures.Count} procedures.");
+            int dlls = _images.Count - 1;
+            Log($"Loaded {Path.GetFileName(path)} — {_images.Count} image(s)" +
+                (dlls > 0 ? $" (EXE + {dlls} debug DLL(s): {string.Join(", ", _siblingDlls.Select(Path.GetFileName))})" : "") +
+                $", {_moduleNames.Count} source modules, {_allProcs.Count} procedures.");
 
             AddRecent(path);
             LoadBreakpoints();   // restore saved breakpoints for this EXE
 
             // show the program's primary module
-            string primary = !string.IsNullOrEmpty(_info.SourceFile) ? _info.SourceFile : withLines.FirstOrDefault() ?? "";
+            string primary = !string.IsNullOrEmpty(_info.SourceFile) ? _info.SourceFile : _moduleNames.FirstOrDefault() ?? "";
             CmbModule.SelectedItem = primary;     // triggers ShowModule
             if (_bps.Count == 0 && _info.ModuleCount == 1 && primary.Equals("dbgtest.clw", StringComparison.OrdinalIgnoreCase))
                 ToggleBreak(21);                  // demo breakpoint for the bundled sample
@@ -119,11 +133,45 @@ public partial class MainWindow : Window
         if (CmbModule.SelectedItem is string name) ShowModule(name);
     }
 
+    /// <summary>Build the image set and source-module catalog: the EXE (module 0) plus every sibling
+    /// Clarion <em>debug</em> DLL in the EXE's directory. A debug DLL is one whose PE carries a TSWD
+    /// blob; the Clarion runtime (ClaRUN) and non-debug DLLs are skipped here (the engine still
+    /// discovers and attributes them at runtime). EXE modules win any name collision.</summary>
+    void DiscoverImages(string exePath)
+    {
+        _images.Clear(); _modOwners.Clear(); _moduleNames.Clear(); _siblingDlls.Clear();
+        _images.Add(new LoadedImage(exePath, Path.GetFileName(exePath), _pe!, _info!));
+
+        var dir = Path.GetDirectoryName(Path.GetFullPath(exePath));
+        if (dir != null && Directory.Exists(dir))
+            foreach (var dll in Directory.EnumerateFiles(dir, "*.dll"))
+            {
+                var name = Path.GetFileName(dll);
+                if (name.StartsWith("clarun", StringComparison.OrdinalIgnoreCase)) continue;  // the runtime, not user code
+                try
+                {
+                    var pe = PeImage.TryLoad(dll);
+                    var info = pe != null ? TswdInfo.Load(pe) : null;
+                    if (info == null) continue;     // not a Clarion debug DLL
+                    _images.Add(new LoadedImage(dll, name, pe!, info));
+                    _siblingDlls.Add(dll);
+                }
+                catch { /* unreadable DLL — skip */ }
+            }
+
+        foreach (var img in _images)
+            foreach (var m in img.Info.Modules)
+                if (m.Lines.Count > 0 && _modOwners.TryAdd(m.Name, (img.Info, img.Name)))
+                    _moduleNames.Add(m.Name);
+    }
+
     void ShowModule(string moduleName)
     {
         _curModule = moduleName;
         string? src = ResolveSource(moduleName);
-        TxtSourceName.Text = src ?? "(source file not found)";
+        string? img = _modOwners.TryGetValue(moduleName, out var ms) ? ms.Image : null;
+        bool fromDll = img != null && !string.Equals(img, Path.GetFileName(_exePath), StringComparison.OrdinalIgnoreCase);
+        TxtSourceName.Text = (src ?? "(source file not found)") + (fromDll ? $"   [{img}]" : "");
         _lines.Clear();
         if (src == null) { Log($"Source not found for {moduleName} (searched exe dir + Clarion libsrc)."); return; }
         int n = 1;
@@ -170,7 +218,7 @@ public partial class MainWindow : Window
     {
         if (_curModule == null || _info == null) return;
         // snap to the nearest line that actually has executable code in this module
-        int line = _info.NearestCodeLine(_curModule, clicked) ?? clicked;
+        int line = (InfoFor(_curModule) ?? _info).NearestCodeLine(_curModule, clicked) ?? clicked;
         var sl = _lines.FirstOrDefault(l => l.LineNo == line);
         var existing = LineBp(_curModule, line);
         if (existing != null)
@@ -202,7 +250,7 @@ public partial class MainWindow : Window
         if (_curModule == null) return;
         if (_state != State.Stopped || _session == null) { Status("Run to cursor needs a stopped program."); return; }
         if (MenuLine(sender) is not SourceLine sl) return;
-        int line = _info?.NearestCodeLine(_curModule, sl.LineNo) ?? sl.LineNo;
+        int line = InfoFor(_curModule)?.NearestCodeLine(_curModule, sl.LineNo) ?? sl.LineNo;
         ClearCurrentLine();
         _session.RunTo(_curModule, line);
         SetState(State.Running);
@@ -217,9 +265,19 @@ public partial class MainWindow : Window
     void BreakOnProcEntry_Click(object sender, RoutedEventArgs e)
     {
         if (LstProcs.SelectedItem is not ProcItem p || _info == null) return;
-        if (_bps.Any(b => b.Rva == p.Rva && b.Label != null)) { Status($"Already breaking on {p.Name}."); return; }
-        var bp = new DebugSession.Breakpoint { Rva = p.Rva, Label = $"⊕ {p.Name}" };
-        var loc = _info.Locate(p.Rva);                 // best-effort source location for display
+        string label = $"⊕ {p.Name}";
+        if (_bps.Any(b => b.Label == label)) { Status($"Already breaking on {p.Name}."); return; }
+        var info = p.Info ?? _info;
+        bool isExe = info == _info;
+        var loc = info.Locate(p.Rva);                  // entry RVA -> (module, line) in the proc's own image
+        // The engine resolves a raw Rva against the EXE only, so a DLL proc-entry must be expressed as
+        // module:line (resolved against the owning DLL's TSWD when it maps).
+        DebugSession.Breakpoint bp;
+        if (isExe)
+            bp = new DebugSession.Breakpoint { Rva = p.Rva, Label = label };
+        else if (loc is { } dl)
+            bp = new DebugSession.Breakpoint(dl.Module, dl.Line) { Label = label };
+        else { Status($"{p.Name}: no source line for its entry in {p.Image}."); return; }
         if (loc != null) { bp.Module = loc.Value.Module; bp.Line = loc.Value.Line; }
         _bps.Add(bp);
         _session?.AddBreakpointLive(bp);
@@ -313,6 +371,7 @@ public partial class MainWindow : Window
 
         _vars.Clear(); _localsRows.Clear(); LstStack.ItemsSource = null;
         _session = new DebugSession(_exePath, _pe, _info) { BreakOnException = ChkBreakCrash.IsChecked == true };
+        foreach (var dll in _siblingDlls) _session.PreloadModule(dll);   // so DLL breakpoints resolve before launch
         _session.Log += s => Dispatcher.Invoke(() => Log(s));
         _session.Stopped += OnStopped;
         _session.Exited += code => Dispatcher.Invoke(() =>
@@ -502,7 +561,7 @@ public partial class MainWindow : Window
     void LstProcs_SelectionChanged(object sender, System.Windows.Controls.SelectionChangedEventArgs e)
     {
         if (_info == null || LstProcs.SelectedItem is not ProcItem p) return;
-        var loc = _info.Locate(p.Rva);   // entry RVA -> (module, line)
+        var loc = (p.Info ?? _info).Locate(p.Rva);   // entry RVA -> (module, line) in the proc's own image
         if (loc is not { } l) { Log($"{p.Name}: no source line for entry 0x{p.Rva:X}."); return; }
         if (l.Module != _curModule)
         {
@@ -873,11 +932,12 @@ public partial class MainWindow : Window
         _typeByModName.Clear(); _typeByName.Clear();
         if (_info == null) return;
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);   // each physical file parsed once
-        foreach (var m in _info.Modules)
-        {
-            var src = ResolveSource(m.Name);
-            if (src != null) ParseSourceFile(m.Name, src, seen, 0);
-        }
+        foreach (var img in _images)
+            foreach (var m in img.Info.Modules)
+            {
+                var src = ResolveSource(m.Name);
+                if (src != null) ParseSourceFile(m.Name, src, seen, 0);
+            }
     }
 
     // parse a source file's declarations, then follow its INCLUDE('file') directives so that
@@ -999,7 +1059,7 @@ public partial class MainWindow : Window
         if (_state != State.Stopped || _session == null || _curModule == null)
         { Status("Set next statement needs a stopped program."); return; }
         if (MenuLine(sender) is not SourceLine sl) return;
-        int line = _info?.NearestCodeLine(_curModule, sl.LineNo) ?? sl.LineNo;
+        int line = InfoFor(_curModule)?.NearestCodeLine(_curModule, sl.LineNo) ?? sl.LineNo;
         if (_session.SetNextStatement(_curModule, line)) Status($"Next statement set to {_curModule}:{line}.");
         else Status("Couldn't set next statement here (must be code in the current procedure).");
     }
@@ -1055,6 +1115,7 @@ public partial class MainWindow : Window
 
         _vars.Clear(); _localsRows.Clear(); LstStack.ItemsSource = null;
         _session = new DebugSession(_exePath!, _pe, _info) { BreakOnException = ChkBreakCrash.IsChecked == true };
+        foreach (var dll in _siblingDlls) _session.PreloadModule(dll);   // so DLL breakpoints resolve on attach
         _session.Log += s => Dispatcher.Invoke(() => Log(s));
         _session.Stopped += OnStopped;
         _session.Exited += code => Dispatcher.Invoke(() =>
@@ -1148,7 +1209,10 @@ public sealed class ProcItem
     public string Name { get; }
     public uint Rva { get; }
     public string Group { get; }                // App, Runtime, or the owning class name (THISWINDOW, BROWSECLASS, …)
-    public ProcItem(string name, uint rva) { Name = name; Rva = rva; Group = GroupOf(name); }
+    public TswdInfo? Info { get; }              // the blob this proc came from (EXE or a DLL); null = EXE
+    public string? Image { get; }               // owning image filename, for display
+    public ProcItem(string name, uint rva, TswdInfo? info = null, string? image = null)
+    { Name = name; Rva = rva; Info = info; Image = image; Group = GroupOf(name); }
     public override string ToString() => $"{Name}  @0x{Rva:X}";
 
     /// <summary>
