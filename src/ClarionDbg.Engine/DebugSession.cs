@@ -6,7 +6,25 @@ namespace ClarionDbg.Engine;
 public sealed class DebugSession
 {
     public enum WriteKind { Int, UInt, Float, Str, Raw }
-    public record Breakpoint(string? Module, int Line);
+
+    /// <summary>A breakpoint with optional condition, hit-count gate, and tracepoint logging.</summary>
+    public sealed class Breakpoint
+    {
+        public string? Module { get; set; }
+        public int Line { get; set; }
+        public uint Rva { get; set; }              // direct RVA (e.g. procedure entry); else resolved from Module/Line
+        public bool Enabled { get; set; } = true;
+        public string? Condition { get; set; }     // e.g. "mylocalvar1 = 5", "count > 10"
+        public string? HitCondition { get; set; }  // "=N" Nth hit, ">=N" from Nth, "%N" every Nth
+        public string? LogMessage { get; set; }    // tracepoint: log this & continue (no stop); {var} interpolated
+        public string? Label { get; set; }         // display label for proc-entry breakpoints
+        public int HitCount;                       // runtime hit counter
+
+        public Breakpoint() { }
+        public Breakpoint(string? module, int line) { Module = module; Line = line; }
+
+        public string Where => Label ?? (Module != null || Line != 0 ? $"{Module}:{Line}" : $"0x{Rva:X8}");
+    }
     public record Frame(string Proc, uint Addr, string? Module, int? Line, IReadOnlyList<VarValue> Locals);
     public record VarValue(string Name, uint Addr, string TypeName, string Display, string Full, int Size, WriteKind Kind);
     public record ThreadRef(uint Tid, string Label);
@@ -26,7 +44,10 @@ public sealed class DebugSession
     uint _base;
     uint _pid;
     readonly Dictionary<uint, byte> _breakpoints = new();   // VA -> original byte
+    readonly Dictionary<uint, Breakpoint> _bpByVa = new();  // VA -> breakpoint metadata
+    readonly object _bpLock = new();
     uint? _reArm;                                            // VA pending re-arm after single-step
+    uint? _pendingTemp;                                      // run-to-cursor target, applied on next resume
     readonly ConcurrentDictionary<uint, IntPtr> _threads = new();
 
     readonly AutoResetEvent _resume = new(false);
@@ -125,7 +146,11 @@ public sealed class DebugSession
         // ---- single-step (stepping or breakpoint re-arm) ----
         if (exCode == Native.EXCEPTION_SINGLE_STEP)
         {
-            if (_reArm is uint rearm) { WriteByte(rearm, 0xCC); _reArm = null; }
+            if (_reArm is uint rearm)   // only re-arm if still an active breakpoint (user may have cleared it while stopped)
+            {
+                bool keep; lock (_bpLock) keep = _breakpoints.ContainsKey(rearm);
+                if (keep) WriteByte(rearm, 0xCC); _reArm = null;
+            }
             if (_stepping == StepKind.None) return Native.DBG_CONTINUE;
             var ctx = GetCtx(hThread);
             return HandleStep(ref ctx, hThread);
@@ -150,6 +175,16 @@ public sealed class DebugSession
                 WriteByte(exAddr, orig);
                 var ctx = GetCtx(hThread);
                 ctx.Eip = exAddr; Native.SetThreadContext(hThread, ref ctx);
+
+                Breakpoint? meta; lock (_bpLock) _bpByVa.TryGetValue(exAddr, out meta);
+                if (meta != null)
+                {
+                    meta.HitCount++;
+                    bool pass = CondOk(meta, ctx) && HitOk(meta);
+                    if (pass && !string.IsNullOrEmpty(meta.LogMessage))   // tracepoint: log & keep going
+                    { Log?.Invoke(FormatTrace(meta, ctx)); pass = false; }
+                    if (!pass) { _reArm = exAddr; Trap(ref ctx, hThread); return Native.DBG_CONTINUE; }
+                }
                 return Stop(ref ctx, hThread, exAddr);
             }
             return Native.DBG_CONTINUE;   // initial loader breakpoint etc.
@@ -211,6 +246,8 @@ public sealed class DebugSession
 
         bool needReArm = userBpAddr != 0;
         if (needReArm) _reArm = userBpAddr;
+
+        if (_pendingTemp is uint tmp) { SetTempBp(tmp, false); _pendingTemp = null; }   // run-to-cursor target
 
         switch (_act)
         {
@@ -279,16 +316,53 @@ public sealed class DebugSession
 
     void ArmBreakpoints()
     {
-        foreach (var bp in RequestedBreaks)
-        {
-            var rva = _info.LineToRva(bp.Line, bp.Module);
-            if (rva is not uint r) { Log?.Invoke($"No code for {bp.Module}:{bp.Line}."); continue; }
-            uint va = _base + r;
-            if (_breakpoints.ContainsKey(va)) continue;
-            _breakpoints[va] = ReadByte(va);
-            WriteByte(va, 0xCC);
-            Log?.Invoke($"Breakpoint armed: {bp.Module}:{bp.Line} @ 0x{va:X8}");
-        }
+        lock (_bpLock)
+            foreach (var bp in RequestedBreaks)
+                if (bp.Enabled) Arm(bp);
+    }
+
+    uint? ResolveVa(Breakpoint bp)
+    {
+        if (bp.Rva != 0) return _base + bp.Rva;
+        var rva = _info.LineToRva(bp.Line, bp.Module);
+        return rva is uint r ? _base + r : null;
+    }
+
+    /// <summary>Place the 0xCC for a breakpoint and register its metadata. Caller holds _bpLock.</summary>
+    void Arm(Breakpoint bp)
+    {
+        if (ResolveVa(bp) is not uint va) { Log?.Invoke($"No code for {bp.Where}."); return; }
+        _bpByVa[va] = bp;
+        if (!_breakpoints.ContainsKey(va)) { _breakpoints[va] = ReadByte(va); WriteByte(va, 0xCC); }
+        Log?.Invoke($"Breakpoint armed: {bp.Where} @ 0x{va:X8}");
+    }
+
+    /// <summary>Restore the original byte and unregister a breakpoint. Caller holds _bpLock.</summary>
+    void Disarm(Breakpoint bp)
+    {
+        if (ResolveVa(bp) is not uint va) return;
+        if (_breakpoints.TryGetValue(va, out var orig)) { WriteByte(va, orig); _breakpoints.Remove(va); }
+        _bpByVa.Remove(va);
+    }
+
+    /// <summary>Add/remove/toggle a breakpoint on a live process (safe while running or stopped).</summary>
+    public void AddBreakpointLive(Breakpoint bp)
+    { lock (_bpLock) if (_hProcess != IntPtr.Zero && bp.Enabled) Arm(bp); }
+
+    public void RemoveBreakpointLive(Breakpoint bp)
+    { lock (_bpLock) if (_hProcess != IntPtr.Zero) Disarm(bp); }
+
+    public void SetBreakpointEnabled(Breakpoint bp, bool enabled)
+    {
+        bp.Enabled = enabled;
+        lock (_bpLock) { if (_hProcess == IntPtr.Zero) return; if (enabled) Arm(bp); else Disarm(bp); }
+    }
+
+    /// <summary>Run until execution reaches a source line (one-shot), then stop.</summary>
+    public void RunTo(string module, int line)
+    {
+        if (_info.LineToRva(line, module) is uint r) _pendingTemp = _base + r;
+        Continue();
     }
 
     uint _stoppedTid;
@@ -347,6 +421,59 @@ public sealed class DebugSession
     {
         if (_hProcess == IntPtr.Zero || !_threads.TryGetValue(tid, out var h)) return Array.Empty<Frame>();
         try { return WalkStack(GetCtx(h)); } catch { return Array.Empty<Frame>(); }
+    }
+
+    // ---- conditional / hit-count / tracepoint evaluation ----
+
+    bool CondOk(Breakpoint bp, Native.CONTEXT ctx)
+    {
+        if (string.IsNullOrWhiteSpace(bp.Condition)) return true;
+        try { return Expr.EvalBool(bp.Condition!, name => ResolveVar(name, ctx)); }
+        catch { return true; }   // a malformed condition shouldn't swallow the breakpoint
+    }
+
+    static bool HitOk(Breakpoint bp)
+    {
+        var h = bp.HitCondition?.Trim();
+        if (string.IsNullOrEmpty(h)) return true;
+        int n;
+        if (h.StartsWith("%")  && int.TryParse(h[1..], out n) && n > 0) return bp.HitCount % n == 0;
+        if (h.StartsWith(">=") && int.TryParse(h[2..], out n))          return bp.HitCount >= n;
+        if (h.StartsWith("=")  && int.TryParse(h[1..], out n))          return bp.HitCount == n;
+        if (int.TryParse(h, out n))                                     return bp.HitCount >= n;
+        return true;
+    }
+
+    string FormatTrace(Breakpoint bp, Native.CONTEXT ctx)
+    {
+        string msg = System.Text.RegularExpressions.Regex.Replace(bp.LogMessage!, @"\{([^}]+)\}",
+            m => ResolveVar(m.Groups[1].Value.Trim(), ctx) ?? m.Value);
+        return $"[trace {bp.Where}#{bp.HitCount}] {msg}";
+    }
+
+    /// <summary>Resolve a variable name to its display value, current frame first then globals.</summary>
+    string? ResolveVar(string name, Native.CONTEXT ctx)
+    {
+        uint rva = ctx.Eip - _base;
+        if (_pe.IsCodeRva(rva) && _info.ProcContaining(rva) is { } proc)
+            foreach (var lv in proc.Locals)
+                if (string.Equals(lv.Name, name, StringComparison.OrdinalIgnoreCase))
+                {
+                    uint va = lv.IsStatic ? _base + lv.Rva : (uint)((long)ctx.Ebp + lv.FrameOffset);
+                    int sz = lv.Type.Size > 0 ? lv.Type.Size : lv.DisplaySize;
+                    return CleanVal(ReadVar(lv.Name, va, lv.Type, sz, lv.Threaded).Display);
+                }
+        foreach (var g in _info.Globals)
+            if (string.Equals(g.Name, name, StringComparison.OrdinalIgnoreCase))
+                return CleanVal(ReadVar(g.Name, _base + g.Rva, g.Type, g.DisplaySize, g.Threaded).Display);
+        return null;
+    }
+
+    static string CleanVal(string d)
+    {
+        d = d.Trim();
+        if (d.Length >= 2 && d[0] == '\'' && d[^1] == '\'') d = d[1..^1].TrimEnd();
+        return d;
     }
 
     readonly List<(uint Ebp, uint Rva)> _liveFrames = new();   // for live re-reading while running

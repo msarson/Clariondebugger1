@@ -95,6 +95,12 @@ sess.Stopped += info2 =>
 };
 
 string? bpModule = args.Length > 2 ? args[2] : null;
-sess.Start(new[] { new DebugSession.Breakpoint(bpModule, bpLine) });
+var bp = new DebugSession.Breakpoint(bpModule, bpLine)
+{
+    Condition    = Environment.GetEnvironmentVariable("CLARIONDBG_COND"),
+    HitCondition = Environment.GetEnvironmentVariable("CLARIONDBG_HIT"),
+    LogMessage   = Environment.GetEnvironmentVariable("CLARIONDBG_TRACE"),
+};
+sess.Start(new[] { bp });
 done.Wait(8000);
 Console.WriteLine("probe finished.");

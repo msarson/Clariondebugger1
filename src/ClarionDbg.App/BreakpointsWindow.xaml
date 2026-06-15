@@ -1,0 +1,49 @@
+<Window x:Class="ClarionDbg.App.BreakpointsWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Breakpoints" Height="420" Width="780" WindowStartupLocation="CenterOwner"
+        ShowInTaskbar="False"
+        Background="{StaticResource Panel}" Foreground="{StaticResource Fg}" FontFamily="Segoe UI">
+    <Grid Margin="12">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <TextBlock Grid.Row="0" Text="Breakpoints" FontWeight="SemiBold" FontSize="15" Margin="0,0,0,8"/>
+
+        <DataGrid x:Name="Grid" Grid.Row="1" AutoGenerateColumns="False" CanUserAddRows="False"
+                  Background="Transparent" Foreground="{StaticResource Fg}" BorderBrush="{StaticResource Border}"
+                  GridLinesVisibility="Horizontal" HorizontalGridLinesBrush="{StaticResource Border}"
+                  RowBackground="Transparent" AlternatingRowBackground="#FF2A2A2D"
+                  HeadersVisibility="Column" FontFamily="Consolas" FontSize="12">
+            <DataGrid.Columns>
+                <DataGridTemplateColumn Header="On" Width="36">
+                    <DataGridTemplateColumn.CellTemplate>
+                        <DataTemplate>
+                            <CheckBox IsChecked="{Binding Enabled, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                                      Click="Enabled_Click" HorizontalAlignment="Center"/>
+                        </DataTemplate>
+                    </DataGridTemplateColumn.CellTemplate>
+                </DataGridTemplateColumn>
+                <DataGridTextColumn Header="Location" Binding="{Binding Where}" IsReadOnly="True" Width="200"/>
+                <DataGridTextColumn Header="Condition  (e.g. count &gt; 5)" Binding="{Binding Condition}" Width="170"/>
+                <DataGridTextColumn Header="Hit  (=N / &gt;=N / %N)" Binding="{Binding HitCondition}" Width="110"/>
+                <DataGridTextColumn Header="Tracepoint log  ({var})" Binding="{Binding LogMessage}" Width="*"/>
+                <DataGridTextColumn Header="Hits" Binding="{Binding HitCount}" IsReadOnly="True" Width="44"/>
+            </DataGrid.Columns>
+        </DataGrid>
+
+        <TextBlock Grid.Row="2" Foreground="{StaticResource FgDim}" FontSize="11" Margin="2,8,0,0"
+                   TextWrapping="Wrap"
+                   Text="Condition: break only when true. Hit: =N Nth hit, &gt;=N from Nth, %N every Nth. Tracepoint: if a log message is set the breakpoint logs it (with {variable} values) and keeps running instead of stopping."/>
+
+        <StackPanel Grid.Row="3" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,12,0,0">
+            <Button Content="Remove" Width="90" Click="Remove_Click"/>
+            <Button Content="Remove all" Width="100" Click="RemoveAll_Click"/>
+            <Button Content="Close" Width="90" Click="Close_Click" IsDefault="True"/>
+        </StackPanel>
+    </Grid>
+</Window>

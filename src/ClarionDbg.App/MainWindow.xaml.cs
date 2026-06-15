@@ -24,7 +24,9 @@ public partial class MainWindow : Window
     string? _stickyFrame;          // keep this procedure selected in the call stack across steps
     bool _suppressStackSource;     // re-selecting a frame on stop shouldn't move the source off the execution line
     bool _suppressThreadEvent;     // populating the thread combo on stop shouldn't trigger a switch
-    readonly HashSet<(string Module, int Line)> _breaks = new();
+    readonly ObservableCollection<DebugSession.Breakpoint> _bps = new();   // master breakpoint list
+    DebugSession.Breakpoint? LineBp(string module, int line) =>
+        _bps.FirstOrDefault(b => b.Label == null && b.Module == module && b.Line == line);
 
     readonly ObservableCollection<SourceLine> _lines = new();
     readonly ObservableCollection<VarRow> _vars = new();
@@ -74,7 +76,7 @@ public partial class MainWindow : Window
         try
         {
             _exePath = path;
-            _breaks.Clear();
+            _bps.Clear();
             _pe = new PeImage(path);
             _info = TswdInfo.Load(_pe);
             if (_info == null) { Log("No .cwdebug info — this EXE was not built in Debug mode (vid=full)."); return; }
@@ -93,10 +95,12 @@ public partial class MainWindow : Window
                 $"({withLines.Count} with debug lines), {_info.Lines.Count} line entries, " +
                 $"{_info.Procedures.Count} procedures.");
 
+            LoadBreakpoints();   // restore saved breakpoints for this EXE
+
             // show the program's primary module
             string primary = !string.IsNullOrEmpty(_info.SourceFile) ? _info.SourceFile : withLines.FirstOrDefault() ?? "";
             CmbModule.SelectedItem = primary;     // triggers ShowModule
-            if (_info.ModuleCount == 1 && primary.Equals("dbgtest.clw", StringComparison.OrdinalIgnoreCase))
+            if (_bps.Count == 0 && _info.ModuleCount == 1 && primary.Equals("dbgtest.clw", StringComparison.OrdinalIgnoreCase))
                 ToggleBreak(21);                  // demo breakpoint for the bundled sample
             Status($"Loaded {Path.GetFileName(path)}. Pick a module, set breakpoints, press Go.");
         }
@@ -120,7 +124,7 @@ public partial class MainWindow : Window
         foreach (var line in File.ReadAllLines(src))
         {
             var sl = new SourceLine { LineNo = n, Text = line.Replace("\t", "    ") };
-            sl.HasBreakpoint = _breaks.Contains((moduleName, n));
+            sl.HasBreakpoint = LineBp(moduleName, n) != null;
             _lines.Add(sl);
             n++;
         }
@@ -161,21 +165,129 @@ public partial class MainWindow : Window
         if (_curModule == null || _info == null) return;
         // snap to the nearest line that actually has executable code in this module
         int line = _info.NearestCodeLine(_curModule, clicked) ?? clicked;
-        var key = (_curModule, line);
         var sl = _lines.FirstOrDefault(l => l.LineNo == line);
-        if (_breaks.Remove(key))
+        var existing = LineBp(_curModule, line);
+        if (existing != null)
         {
+            _bps.Remove(existing);
+            _session?.RemoveBreakpointLive(existing);
             if (sl != null) sl.HasBreakpoint = false;
             Log($"Breakpoint cleared at {_curModule}:{line}.");
         }
         else
         {
-            _breaks.Add(key);
+            var bp = new DebugSession.Breakpoint(_curModule, line);
+            _bps.Add(bp);
+            _session?.AddBreakpointLive(bp);
             if (sl != null) sl.HasBreakpoint = true;
             Log(line == clicked
                 ? $"Breakpoint set at {_curModule}:{line}."
                 : $"Breakpoint set at {_curModule}:{line} (no code on line {clicked}; moved to nearest).");
         }
+        SaveBreakpoints();
+    }
+
+    // ---------- run-to-cursor & break-on-procedure-entry ----------
+    static SourceLine? MenuLine(object sender) =>
+        (sender as FrameworkElement)?.DataContext as SourceLine;
+
+    void RunToCursor_Click(object sender, RoutedEventArgs e)
+    {
+        if (_curModule == null) return;
+        if (_state != State.Stopped || _session == null) { Status("Run to cursor needs a stopped program."); return; }
+        if (MenuLine(sender) is not SourceLine sl) return;
+        int line = _info?.NearestCodeLine(_curModule, sl.LineNo) ?? sl.LineNo;
+        ClearCurrentLine();
+        _session.RunTo(_curModule, line);
+        SetState(State.Running);
+        Status($"Running to {_curModule}:{line}…");
+    }
+
+    void ToggleBreakMenu_Click(object sender, RoutedEventArgs e)
+    {
+        if (MenuLine(sender) is SourceLine sl) ToggleBreak(sl.LineNo);
+    }
+
+    void BreakOnProcEntry_Click(object sender, RoutedEventArgs e)
+    {
+        if (LstProcs.SelectedItem is not ProcItem p || _info == null) return;
+        if (_bps.Any(b => b.Rva == p.Rva && b.Label != null)) { Status($"Already breaking on {p.Name}."); return; }
+        var bp = new DebugSession.Breakpoint { Rva = p.Rva, Label = $"⊕ {p.Name}" };
+        var loc = _info.Locate(p.Rva);                 // best-effort source location for display
+        if (loc != null) { bp.Module = loc.Value.Module; bp.Line = loc.Value.Line; }
+        _bps.Add(bp);
+        _session?.AddBreakpointLive(bp);
+        SaveBreakpoints();
+        Log($"Break on entry of {p.Name} (0x{p.Rva:X8}).");
+        Status($"Will break when {p.Name} is entered.");
+    }
+
+    // ---------- breakpoint manager ----------
+    void BtnBreakpoints_Click(object sender, RoutedEventArgs e)
+    {
+        var win = new BreakpointsWindow(_bps, _session) { Owner = this };
+        win.ShowDialog();
+        // reflect any gutter changes for the current module after edits/removals
+        if (_curModule != null)
+            foreach (var sl in _lines) sl.HasBreakpoint = LineBp(_curModule, sl.LineNo) != null;
+        SaveBreakpoints();
+    }
+
+    // ---------- persistence (per-EXE, under %APPDATA%\ClarionDbg\breakpoints) ----------
+    sealed class BpDto
+    {
+        public string? Module { get; set; }
+        public int Line { get; set; }
+        public uint Rva { get; set; }
+        public bool Enabled { get; set; } = true;
+        public string? Condition { get; set; }
+        public string? HitCondition { get; set; }
+        public string? LogMessage { get; set; }
+        public string? Label { get; set; }
+    }
+
+    string BpStorePath()
+    {
+        var dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                               "ClarionDbg", "breakpoints");
+        Directory.CreateDirectory(dir);
+        string key = Path.GetFileNameWithoutExtension(_exePath ?? "x") + "_" +
+                     (uint)(_exePath ?? "").ToLowerInvariant().GetHashCode();
+        return Path.Combine(dir, key + ".json");
+    }
+
+    void SaveBreakpoints()
+    {
+        if (_exePath == null) return;
+        try
+        {
+            var dto = _bps.Select(b => new BpDto
+            {
+                Module = b.Module, Line = b.Line, Rva = b.Rva, Enabled = b.Enabled,
+                Condition = b.Condition, HitCondition = b.HitCondition, LogMessage = b.LogMessage, Label = b.Label
+            }).ToList();
+            File.WriteAllText(BpStorePath(), System.Text.Json.JsonSerializer.Serialize(dto));
+        }
+        catch { /* best effort */ }
+    }
+
+    void LoadBreakpoints()
+    {
+        try
+        {
+            var path = BpStorePath();
+            if (!File.Exists(path)) return;
+            var dto = System.Text.Json.JsonSerializer.Deserialize<List<BpDto>>(File.ReadAllText(path));
+            if (dto == null) return;
+            foreach (var d in dto)
+                _bps.Add(new DebugSession.Breakpoint
+                {
+                    Module = d.Module, Line = d.Line, Rva = d.Rva, Enabled = d.Enabled,
+                    Condition = d.Condition, HitCondition = d.HitCondition, LogMessage = d.LogMessage, Label = d.Label
+                });
+            if (_bps.Count > 0) Log($"Restored {_bps.Count} saved breakpoint(s).");
+        }
+        catch { /* ignore corrupt store */ }
     }
 
     // ---------- run control ----------
@@ -185,7 +297,7 @@ public partial class MainWindow : Window
         if (_state == State.Running) return;
         if (_pe == null || _info == null || _exePath == null) { Log("Open a debug EXE first."); return; }
 
-        if (_breaks.Count == 0) { Log("Set at least one breakpoint (click the gutter)."); return; }
+        if (_bps.Count == 0) { Log("Set at least one breakpoint (click the gutter)."); return; }
 
         _vars.Clear(); _localsRows.Clear(); LstStack.ItemsSource = null;
         _session = new DebugSession(_exePath, _pe, _info) { BreakOnException = ChkBreakCrash.IsChecked == true };
@@ -196,7 +308,8 @@ public partial class MainWindow : Window
             Log($"--- debuggee exited (code {code}) ---");
             ClearCurrentLine(); SetState(State.Idle); Status("Exited.");
         });
-        _session.Start(_breaks.Select(b => new DebugSession.Breakpoint(b.Module, b.Line)));
+        foreach (var b in _bps) b.HitCount = 0;
+        _session.Start(_bps.ToList());
         SetState(State.Running);
         Status("Running…");
     }

@@ -47,6 +47,17 @@ ABC application — `School`, 54 modules):
   update in place from process memory (no re-break needed).
 - **Edit values** — right-click / double-click a variable → set a new value (writes to the
   live process via `WriteProcessMemory`).
+- **Breakpoint power features** — beyond plain line breakpoints:
+  - **Conditional breakpoints** — break only when an expression is true (`count > 10`,
+    `mylocalvar1 = 5`), evaluated against the current frame's locals and the globals.
+  - **Hit counts** — break on the Nth hit (`=5`), from the Nth on (`>=5`), or every Nth (`%3`).
+  - **Tracepoints** — a breakpoint that logs a message and keeps running instead of stopping,
+    with `{variable}` values interpolated (e.g. `LocIdx={LocIdx} LocSum={LocSum}`).
+  - **Run to cursor** — right-click a source line → run there (one-shot).
+  - **Break on procedure entry** — right-click any procedure → stop when it's entered.
+  - **Breakpoint manager** — a window to enable/disable, edit conditions / hit counts /
+    tracepoint logs, see hit counts, and remove breakpoints; all editable live while running.
+  - **Persistence** — breakpoints are saved per-EXE and restored next time you open it.
 - **Break on crash** — automatically stops at the faulting instruction on a GPF / access
   violation, divide-by-zero, stack overflow, illegal instruction, etc. (toggle "Break on crash"),
   so you can inspect the call stack and variables before the app dies.
@@ -148,7 +159,10 @@ MSBuild.exe sample/dbgtest/dbgtest.cwproj /p:Configuration=Debug `
       writes the new value to process memory (`WriteProcessMemory`). Parses by kind: integer,
       float, string (space-padded like a Clarion STRING), or raw hex; re-reads to confirm.
 - [ ] Clarion ROUTINE frame sharing (routines reuse the parent procedure's locals).
-- [ ] Edit-variable-at-runtime (`WriteProcessMemory`), watch expressions, conditional BPs.
+- [x] **Conditional breakpoints, hit counts, and tracepoints** — break on a condition
+      (`count > 10`), on the Nth/every-Nth hit (`=5`/`%3`), or log-and-continue with
+      `{variable}` interpolation; plus **run-to-cursor**, **break-on-procedure-entry**, a
+      **breakpoint manager** window, and **per-EXE persistence**.
 - [ ] STRING/CSTRING/PSTRING distinction; DATE/TIME calendar formatting.
 - [x] **Break on crash** — stop at the faulting instruction on any fatal exception (GPF,
       divide-by-zero, stack overflow, illegal/privileged instruction, in-page error) so the

@@ -23,6 +23,9 @@
                 <Button x:Name="BtnStepOut" Click="BtnStepOut_Click" Content="⤒ Out (⇧F11)" IsEnabled="False"/>
                 <Button x:Name="BtnStop" Click="BtnStop_Click" Content="■  Stop" IsEnabled="False"/>
                 <Border Width="1" Background="{StaticResource Border}" Margin="8,2"/>
+                <Button x:Name="BtnBreakpoints" Click="BtnBreakpoints_Click" Content="● Breakpoints…"
+                        ToolTip="Manage breakpoints: enable/disable, conditions, hit counts, tracepoints"/>
+                <Border Width="1" Background="{StaticResource Border}" Margin="8,2"/>
                 <CheckBox x:Name="ChkBreakCrash" Content="Break on crash" IsChecked="True"
                           Foreground="{StaticResource Fg}" VerticalAlignment="Center" Margin="4,0" FontSize="12"
                           Checked="ChkBreakCrash_Changed" Unchecked="ChkBreakCrash_Changed"
@@ -61,7 +64,13 @@
                              ToolTip="Type to filter, e.g. BrowseStudents"/>
                     <ListBox x:Name="LstProcs" Background="Transparent" Foreground="{StaticResource Fg}"
                              BorderThickness="0" FontFamily="Consolas" FontSize="12"
-                             SelectionChanged="LstProcs_SelectionChanged"/>
+                             SelectionChanged="LstProcs_SelectionChanged">
+                        <ListBox.ContextMenu>
+                            <ContextMenu>
+                                <MenuItem Header="Break on procedure entry" Click="BreakOnProcEntry_Click"/>
+                            </ContextMenu>
+                        </ListBox.ContextMenu>
+                    </ListBox>
                 </DockPanel>
                 <DockPanel Grid.Row="1">
                     <TextBlock DockPanel.Dock="Top" Text="THREADS" Style="{StaticResource Header}"/>
@@ -96,6 +105,12 @@
                         <ItemsControl.ItemTemplate>
                             <DataTemplate>
                                 <Border Background="{Binding RowBg}" Tag="{Binding}">
+                                    <Border.ContextMenu>
+                                        <ContextMenu>
+                                            <MenuItem Header="Run to cursor" Click="RunToCursor_Click"/>
+                                            <MenuItem Header="Toggle breakpoint" Click="ToggleBreakMenu_Click"/>
+                                        </ContextMenu>
+                                    </Border.ContextMenu>
                                     <Grid>
                                         <Grid.ColumnDefinitions>
                                             <ColumnDefinition Width="22"/>
