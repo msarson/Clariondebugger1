@@ -9,8 +9,10 @@ public sealed class DebugSession
     public record Breakpoint(string? Module, int Line);
     public record Frame(string Proc, uint Addr, string? Module, int? Line, IReadOnlyList<VarValue> Locals);
     public record VarValue(string Name, uint Addr, string TypeName, string Display, string Full, int Size, WriteKind Kind);
+    public record ThreadRef(uint Tid, string Label);
     public record StopInfo(uint Eip, string? Module, int? Line, IReadOnlyList<Frame> Stack,
-                           IReadOnlyList<VarValue> Globals, IReadOnlyList<VarValue> Locals, string Reason);
+                           IReadOnlyList<VarValue> Globals, IReadOnlyList<VarValue> Locals,
+                           IReadOnlyList<ThreadRef> Threads, uint Tid, string Reason);
 
     public event Action<StopInfo>? Stopped;
     public event Action<int>? Exited;
@@ -94,6 +96,10 @@ public sealed class DebugSession
                     _threads[tid] = (IntPtr)U32(buf, 12);
                     break;
 
+                case Native.EXIT_THREAD_DEBUG_EVENT:
+                    _threads.TryRemove(tid, out _);
+                    break;
+
                 case Native.EXIT_PROCESS_DEBUG_EVENT:
                     Log?.Invoke($"Process exited (code {U32(buf, 12)}).");
                     Exited?.Invoke((int)U32(buf, 12));
@@ -113,6 +119,7 @@ public sealed class DebugSession
     {
         uint exCode = U32(buf, 12);
         uint exAddr = U32(buf, 24);
+        _stoppedTid = tid;
         var hThread = _threads.TryGetValue(tid, out var h) ? h : _hThread;
 
         // ---- single-step (stepping or breakpoint re-arm) ----
@@ -284,12 +291,25 @@ public sealed class DebugSession
         }
     }
 
+    uint _stoppedTid;
+
     void ReportStop(Native.CONTEXT ctx, string reason)
     {
         uint eipRva = ctx.Eip - _base;
         var loc = _info.Locate(eipRva);
+        var stack = WalkStack(ctx);
 
-        // EBP call-stack walk — each frame carries its own locals (read at that frame's EBP)
+        var globals = new List<VarValue>();
+        foreach (var g in _info.Globals)
+            globals.Add(ReadVar(g.Name, _base + g.Rva, g.Type, g.DisplaySize, g.Threaded));
+
+        Stopped?.Invoke(new StopInfo(ctx.Eip, loc?.Module, loc?.Line, stack, globals,
+                                     stack[0].Locals, BuildThreads(), _stoppedTid, reason));
+    }
+
+    /// <summary>EBP call-stack walk for a thread context; each frame carries its own locals.</summary>
+    List<Frame> WalkStack(Native.CONTEXT ctx)
+    {
         _liveFrames.Clear();
         var stack = new List<Frame> { MakeFrame(ctx.Eip, ctx.Ebp) };
         uint ebp = ctx.Ebp;
@@ -302,13 +322,31 @@ public sealed class DebugSession
             if (nextEbp <= ebp) break;
             ebp = nextEbp;
         }
+        return stack;
+    }
 
-        // globals (typed where possible, else raw hex+ascii sized by the next-symbol gap)
-        var globals = new List<VarValue>();
-        foreach (var g in _info.Globals)
-            globals.Add(ReadVar(g.Name, _base + g.Rva, g.Type, g.DisplaySize, g.Threaded));
+    List<ThreadRef> BuildThreads()
+    {
+        var list = new List<ThreadRef>();
+        foreach (var kv in _threads)
+        {
+            Native.CONTEXT c;
+            try { c = GetCtx(kv.Value); } catch { continue; }
+            uint rva = c.Eip - _base;
+            string where = _pe.IsCodeRva(rva)
+                ? (_info.ProcContaining(rva)?.Name ?? $"0x{c.Eip:X8}")
+                : $"[runtime] 0x{c.Eip:X8}";
+            string mark = kv.Key == _stoppedTid ? "►" : "  ";
+            list.Add(new ThreadRef(kv.Key, $"{mark} Thread {kv.Key}   {where}"));
+        }
+        return list.OrderByDescending(t => t.Tid == _stoppedTid).ThenBy(t => t.Tid).ToList();
+    }
 
-        Stopped?.Invoke(new StopInfo(ctx.Eip, loc?.Module, loc?.Line, stack, globals, stack[0].Locals, reason));
+    /// <summary>Rebuild the call stack for another thread (valid while stopped — all threads are suspended).</summary>
+    public IReadOnlyList<Frame> SwitchThread(uint tid)
+    {
+        if (_hProcess == IntPtr.Zero || !_threads.TryGetValue(tid, out var h)) return Array.Empty<Frame>();
+        try { return WalkStack(GetCtx(h)); } catch { return Array.Empty<Frame>(); }
     }
 
     readonly List<(uint Ebp, uint Rva)> _liveFrames = new();   // for live re-reading while running

@@ -23,6 +23,7 @@ public partial class MainWindow : Window
     bool _suppressModuleEvent;
     string? _stickyFrame;          // keep this procedure selected in the call stack across steps
     bool _suppressStackSource;     // re-selecting a frame on stop shouldn't move the source off the execution line
+    bool _suppressThreadEvent;     // populating the thread combo on stop shouldn't trigger a switch
     readonly HashSet<(string Module, int Line)> _breaks = new();
 
     readonly ObservableCollection<SourceLine> _lines = new();
@@ -222,19 +223,43 @@ public partial class MainWindow : Window
                 ((FrameworkElement?)SourceList.ItemContainerGenerator.ContainerFromItem(sl))?.BringIntoView(); }
         }
 
+        // thread list — mark the stopped thread, let the user switch to inspect another stack
+        _suppressThreadEvent = true;
+        CmbThreads.ItemsSource = info.Threads;
+        CmbThreads.DisplayMemberPath = nameof(DebugSession.ThreadRef.Label);
+        var cur = info.Threads.FirstOrDefault(t => t.Tid == info.Tid);
+        CmbThreads.SelectedItem = cur ?? info.Threads.FirstOrDefault();
+        _suppressThreadEvent = false;
+
         // rebuild the call stack, keeping the user's selected procedure selected if it's still present
-        var rows = info.Stack.Select((f, i) => new FrameRow(i, f)).ToList();
-        LstStack.ItemsSource = rows;
-        int sel = _stickyFrame != null ? rows.FindIndex(r => r.Frame.Proc == _stickyFrame) : -1;
-        _suppressStackSource = true;          // keep the source on the execution line, not the re-selected frame
-        LstStack.SelectedIndex = sel >= 0 ? sel : 0;
-        _suppressStackSource = false;
+        ShowStack(info.Stack);
 
         _vars.Clear();
         foreach (var v in info.Globals) _vars.Add(ToRow(v, null));
 
         Status($"Stopped at line {info.Line}. Press Go to continue.");
     });
+
+    /// <summary>Populate the call-stack list from a set of frames, restoring the sticky selection.</summary>
+    void ShowStack(IReadOnlyList<DebugSession.Frame> frames)
+    {
+        var rows = frames.Select((f, i) => new FrameRow(i, f)).ToList();
+        LstStack.ItemsSource = rows;
+        int sel = _stickyFrame != null ? rows.FindIndex(r => r.Frame.Proc == _stickyFrame) : -1;
+        _suppressStackSource = true;          // keep the source on the execution line, not the re-selected frame
+        LstStack.SelectedIndex = sel >= 0 ? sel : 0;
+        _suppressStackSource = false;
+    }
+
+    void CmbThreads_SelectionChanged(object sender, System.Windows.Controls.SelectionChangedEventArgs e)
+    {
+        if (_suppressThreadEvent || _session == null) return;
+        if (CmbThreads.SelectedItem is not DebugSession.ThreadRef tr) return;
+        var frames = _session.SwitchThread(tr.Tid);
+        if (frames.Count == 0) { Status($"Thread {tr.Tid}: no readable stack."); return; }
+        ShowStack(frames);
+        Status($"Showing thread {tr.Tid}.");
+    }
 
     void LstStack_SelectionChanged(object sender, System.Windows.Controls.SelectionChangedEventArgs e)
     {

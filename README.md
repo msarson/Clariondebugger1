@@ -47,6 +47,12 @@ ABC application — `School`, 54 modules):
   update in place from process memory (no re-break needed).
 - **Edit values** — right-click / double-click a variable → set a new value (writes to the
   live process via `WriteProcessMemory`).
+- **Break on crash** — automatically stops at the faulting instruction on a GPF / access
+  violation, divide-by-zero, stack overflow, illegal instruction, etc. (toggle "Break on crash"),
+  so you can inspect the call stack and variables before the app dies.
+- **Thread list & switching** — a thread picker shows every live thread and where each is
+  executing; switch threads to walk another thread's call stack (and its per-frame locals)
+  while stopped.
 - **WPF UI** — professional dark theme, breakpoint gutter, current-line highlight, output log.
 
 Built on the decoded **TSWD** debug format (`TSWD_FORMAT.md`) — no dependency on the
@@ -144,6 +150,12 @@ MSBuild.exe sample/dbgtest/dbgtest.cwproj /p:Configuration=Debug `
 - [ ] Clarion ROUTINE frame sharing (routines reuse the parent procedure's locals).
 - [ ] Edit-variable-at-runtime (`WriteProcessMemory`), watch expressions, conditional BPs.
 - [ ] STRING/CSTRING/PSTRING distinction; DATE/TIME calendar formatting.
-- [ ] Disassembly + memory windows, threads list.
+- [x] **Break on crash** — stop at the faulting instruction on any fatal exception (GPF,
+      divide-by-zero, stack overflow, illegal/privileged instruction, in-page error) so the
+      stack and variables are inspectable before the process unwinds.
+- [x] **Thread list + switching** — live thread picker (marks the stopped thread, shows each
+      thread's current procedure); switch to walk any thread's call stack and per-frame locals
+      (safe because all threads are suspended while stopped).
+- [ ] Disassembly + memory windows.
 - [ ] DLL debug info (`.cwdebug` in DLLs), multi-module programs.
 ```
