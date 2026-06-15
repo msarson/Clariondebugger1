@@ -78,7 +78,9 @@ ABC application — `School`, 54 modules):
   watched variable to edit it.
 - **Hover data tips** — hover any variable in the source view to see its current value in a
   tooltip (name, type, and value, with DATE/TIME formatted). Resolves against the selected stack
-  frame and works both when stopped and live while the program is running.
+  frame and works both when stopped and live while the program is running. Hovering an **EQUATE**
+  shows its compile-time constant value (decoded to decimal for hex/binary/octal literals),
+  resolved from the source and any `INCLUDE`d files — so it works even before the program runs.
 - **Break on crash** — automatically stops at the faulting instruction on a GPF / access
   violation, divide-by-zero, stack overflow, illegal instruction, etc. (toggle "Break on crash"),
   so you can inspect the call stack and variables before the app dies.

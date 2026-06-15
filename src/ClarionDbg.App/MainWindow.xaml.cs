@@ -555,7 +555,6 @@ public partial class MainWindow : Window
 
     void SourceText_MouseMove(object sender, MouseEventArgs e)
     {
-        if (_session == null || _state == State.Idle) { HideDataTip(); return; }
         if (sender is not System.Windows.Controls.TextBlock tb || tb.DataContext is not SourceLine sl)
         { HideDataTip(); return; }
 
@@ -565,16 +564,65 @@ public partial class MainWindow : Window
         if (word == null) { HideDataTip(); return; }
         if (word == _dataTipWord && _dataPopup?.IsOpen == true) return;   // already showing this word
 
-        int frame = LstStack.SelectedIndex < 0 ? 0 : LstStack.SelectedIndex;
-        DebugSession.VarValue? v;
-        try { v = _session.EvalWatch(word, frame); } catch { v = null; }
-        if (v == null || v.Display is "<not found>" or "<error>") { HideDataTip(); return; }
+        // 1) live variable value — needs a running/stopped session and the right frame
+        if (_session != null && _state != State.Idle)
+        {
+            int frame = LstStack.SelectedIndex < 0 ? 0 : LstStack.SelectedIndex;
+            DebugSession.VarValue? v;
+            try { v = _session.EvalWatch(word, frame); } catch { v = null; }
+            if (v != null && v.Display is not ("<not found>" or "<error>"))
+            {
+                _dataTipWord = word;
+                string type = LookupDeclType(_curModule, v.Name) ?? v.TypeName;
+                string body = v.Display;
+                if (TryFormatClarionDateTime(type, v.Display, out var pretty)) body = $"{pretty}   (raw {v.Display})";
+                ShowDataTip(tb, pos, word, type, body, v.Full);
+                return;
+            }
+        }
 
-        _dataTipWord = word;
-        string type = LookupDeclType(_curModule, v.Name) ?? v.TypeName;
-        string body = v.Display;
-        if (TryFormatClarionDateTime(type, v.Display, out var pretty)) body = $"{pretty}   (raw {v.Display})";
-        ShowDataTip(tb, pos, word, type, body, v.Full);
+        // 2) EQUATE constant — compile-time, so it shows even before the program runs
+        if (TryEquate(word, out var evalue, out var efull))
+        {
+            _dataTipWord = word;
+            ShowDataTip(tb, pos, word, "EQUATE", evalue, efull);
+            return;
+        }
+
+        HideDataTip();
+    }
+
+    /// <summary>Resolve a word to an EQUATE constant declared in the source (incl. INCLUDE files).</summary>
+    bool TryEquate(string word, out string value, out string full)
+    {
+        value = ""; full = "";
+        var decl = LookupDeclType(_curModule, word);
+        if (decl == null) return false;
+        var m = System.Text.RegularExpressions.Regex.Match(decl, @"^EQUATE\s*\(\s*(.*?)\s*\)\s*$",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        if (!m.Success) return false;
+        string raw = m.Groups[1].Value.Trim();
+        value = raw.Length == 0 ? "(empty)" : raw;
+        if (TryClarionNumber(raw, out long num) && num.ToString() != raw)
+            full = $"=  {num}  (decimal)";
+        return true;
+    }
+
+    /// <summary>Parse a Clarion numeric literal: decimal, hex (<c>0FFh</c>), binary (<c>101b</c>), octal (<c>17o</c>).</summary>
+    static bool TryClarionNumber(string s, out long n)
+    {
+        n = 0; s = s.Trim();
+        if (s.Length == 0) return false;
+        try
+        {
+            char suf = char.ToLowerInvariant(s[^1]);
+            string body = s[..^1];
+            if (suf == 'h' && body.Length > 0) { n = Convert.ToInt64(body, 16); return true; }
+            if (suf == 'b' && body.Length > 0 && body.All(c => c is '0' or '1')) { n = Convert.ToInt64(body, 2); return true; }
+            if (suf == 'o' && body.Length > 0 && body.All(c => c is >= '0' and <= '7')) { n = Convert.ToInt64(body, 8); return true; }
+            return long.TryParse(s, out n);
+        }
+        catch { return false; }
     }
 
     void SourceText_MouseLeave(object sender, MouseEventArgs e) => HideDataTip();
@@ -794,12 +842,43 @@ public partial class MainWindow : Window
     {
         _typeByModName.Clear(); _typeByName.Clear();
         if (_info == null) return;
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);   // each physical file parsed once
         foreach (var m in _info.Modules)
         {
             var src = ResolveSource(m.Name);
-            if (src == null) continue;
-            try { ParseDecls(m.Name, File.ReadAllLines(src)); } catch { }
+            if (src != null) ParseSourceFile(m.Name, src, seen, 0);
         }
+    }
+
+    // parse a source file's declarations, then follow its INCLUDE('file') directives so that
+    // EQUATEs (and types) declared in included files are captured too.
+    void ParseSourceFile(string module, string path, HashSet<string> seen, int depth)
+    {
+        if (depth > 6 || !seen.Add(path)) return;
+        string[] lines;
+        try { lines = File.ReadAllLines(path); } catch { return; }
+        ParseDecls(module, lines);
+        foreach (var line in lines)
+        {
+            var inc = ExtractInclude(line);
+            if (inc == null) continue;
+            var p = ResolveSource(inc) ?? ResolveNear(path, inc);
+            if (p != null) ParseSourceFile(module, p, seen, depth + 1);
+        }
+    }
+
+    static string? ExtractInclude(string line)
+    {
+        if (FindComment(line) == 0) return null;
+        var m = System.Text.RegularExpressions.Regex.Match(line, @"INCLUDE\s*\(\s*'([^']+)'",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        return m.Success ? m.Groups[1].Value : null;
+    }
+
+    static string? ResolveNear(string fromFile, string include)
+    {
+        try { var p = Path.Combine(Path.GetDirectoryName(fromFile)!, include); return File.Exists(p) ? p : null; }
+        catch { return null; }
     }
 
     void ParseDecls(string module, string[] lines)
