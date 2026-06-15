@@ -430,6 +430,19 @@ public sealed class TswdInfo
 
     public int? RvaToLine(uint rva) => Locate(rva)?.Line;
 
+    /// <summary>True if this blob carries a compiland with the given name that has debug lines.</summary>
+    public bool HasModule(string? module) =>
+        module != null && Modules.Any(m => m.Lines.Count > 0 && m.Name.Equals(module, StringComparison.OrdinalIgnoreCase));
+
+    /// <summary>Resolve a line ONLY within the named module of this blob (no cross-module fallback).
+    /// Used for multi-DLL breakpoint resolution where a stray same-numbered line in an unrelated
+    /// compiland of another image must not produce a false match.</summary>
+    public uint? LineToRvaStrict(int line, string module)
+    {
+        var m = Modules.FirstOrDefault(x => x.Name.Equals(module, StringComparison.OrdinalIgnoreCase));
+        return m != null ? LineInModule(m, line) : null;
+    }
+
     /// <summary>Resolve a breakpoint to an address: prefer the given module, else any module.</summary>
     public uint? LineToRva(int line, string? module = null)
     {

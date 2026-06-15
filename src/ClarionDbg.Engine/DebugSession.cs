@@ -3,7 +3,7 @@ using System.Collections.Concurrent;
 
 namespace ClarionDbg.Engine;
 
-public sealed class DebugSession
+public sealed partial class DebugSession
 {
     public enum WriteKind { Int, UInt, Float, Str, Raw }
 
@@ -36,15 +36,14 @@ public sealed class DebugSession
     public event Action<int>? Exited;
     public event Action<string>? Log;
 
-    readonly PeImage _pe;
-    readonly TswdInfo _info;
     readonly string _exePath;
 
     IntPtr _hProcess, _hThread;
-    uint _base;
     uint _pid;
     readonly Dictionary<uint, byte> _breakpoints = new();   // VA -> original byte
     readonly Dictionary<uint, Breakpoint> _bpByVa = new();  // VA -> breakpoint metadata
+    readonly List<Breakpoint> _logical = new();             // every enabled logical bp (armed or pending)
+    readonly Dictionary<Breakpoint, uint> _armedAt = new(); // bp -> VA it is currently planted at
     readonly object _bpLock = new();
     uint? _reArm;                                            // VA pending re-arm after single-step
     uint? _pendingTemp;                                      // run-to-cursor target, applied on next resume
@@ -65,7 +64,20 @@ public sealed class DebugSession
     readonly HashSet<uint> _overReturns = new();            // temp bps that are step-over-call returns
 
     public DebugSession(string exePath, PeImage pe, TswdInfo info)
-    { _exePath = exePath; _pe = pe; _info = info; }
+    {
+        _exePath = exePath;
+        _exe = new LoadedModule
+        {
+            Path = exePath,
+            Name = Path.GetFileName(exePath).ToLowerInvariant(),
+            Pe = pe,
+            Info = info,
+            Size = pe.SizeOfImage,
+            Preloaded = true,
+        };
+        _modules.Add(_exe);
+        RebuildModSnapshot();
+    }
 
     public IReadOnlyList<Breakpoint> RequestedBreaks { get; private set; } = Array.Empty<Breakpoint>();
 
@@ -135,12 +147,23 @@ public sealed class DebugSession
             switch (code)
             {
                 case Native.CREATE_PROCESS_DEBUG_EVENT:
+                    // union @+12: hFile(+12) hProcess(+16) hThread(+20) lpBaseOfImage(+24)
                     _hProcess = (IntPtr)U32(buf, 16);
                     _hThread = (IntPtr)U32(buf, 20);
-                    _base = U32(buf, 24);
+                    SetExeBase(U32(buf, 24));
                     _threads[tid] = _hThread;
-                    Log?.Invoke($"Process created. image base = 0x{_base:X8}");
+                    Log?.Invoke($"Process created. {_exe.Name} image base = 0x{_exe.LoadBase:X8}");
                     ArmBreakpoints();
+                    break;
+
+                case Native.LOAD_DLL_DEBUG_EVENT:
+                    // union @+12: hFile(+12) lpBaseOfDll(+16)
+                    OnDllLoaded((IntPtr)U32(buf, 12), U32(buf, 16));
+                    break;
+
+                case Native.UNLOAD_DLL_DEBUG_EVENT:
+                    // union @+12: lpBaseOfDll(+12)
+                    OnDllUnloaded(U32(buf, 12));
                     break;
 
                 case Native.CREATE_THREAD_DEBUG_EVENT:
@@ -269,10 +292,9 @@ public sealed class DebugSession
         if (_act == Act.Terminate) { Native.TerminateProcess(_hProcess, 0); return Native.DBG_CONTINUE; }
 
         ctx = GetCtx(hThread);
-        uint eipRva = ctx.Eip - _base;
-        (_stepLo, _stepHi) = _info.ProcRange(eipRva);
+        (_stepLo, _stepHi) = ProcRangeAbs(ctx.Eip);   // absolute VA range of the current procedure
         _stepEbp = ctx.Ebp; _stepGuard = 0;
-        var l = _info.Locate(eipRva); _stepModule = l?.Module; _stepLine = l?.Line ?? -1;
+        var l = LocateAt(ctx.Eip); _stepModule = l?.Module; _stepLine = l?.Line ?? -1;
 
         bool needReArm = userBpAddr != 0;
         if (needReArm) _reArm = userBpAddr;
@@ -285,7 +307,7 @@ public sealed class DebugSession
             case Act.Over: _stepping = StepKind.Over; Trap(ref ctx, hThread); break;
             case Act.Out:
                 uint ret = ReadDword(ctx.Ebp + 4);
-                if (ret != 0 && _pe.IsCodeRva(ret - _base)) SetTempBp(ret, false);
+                if (ret != 0 && IsCode(ret)) SetTempBp(ret, false);
                 if (needReArm) Trap(ref ctx, hThread);   // step past the bp, re-arm, then run to ret
                 break;
             default:                                     // Continue
@@ -299,10 +321,10 @@ public sealed class DebugSession
     uint HandleStep(ref Native.CONTEXT ctx, IntPtr hThread)
     {
         if (++_stepGuard > 300000) return Stop(ref ctx, hThread, 0);   // safety bound
-        uint eipRva = ctx.Eip - _base;
-        bool inText = _pe.IsCodeRva(eipRva);
-        bool inProc = inText && eipRva >= _stepLo && eipRva < _stepHi;
-        var l = inText ? _info.Locate(eipRva) : null;
+        uint eip = ctx.Eip;
+        bool inText = IsCode(eip);
+        bool inProc = inText && eip >= _stepLo && eip < _stepHi;
+        var l = inText ? LocateAt(eip) : null;
         bool newLine = l is { } x && (x.Module != _stepModule || x.Line != _stepLine);
 
         if (_stepping == StepKind.Over && !inProc)
@@ -314,9 +336,9 @@ public sealed class DebugSession
         }
         if (_stepping == StepKind.Into && !inText)
         {
-            // stepped into runtime (ClaRUN) — run to return rather than single-step library code
+            // stepped into runtime / a non-debug DLL — run to return rather than single-step it
             uint ret = ReadDword(ctx.Esp);
-            if (ret != 0 && _pe.IsCodeRva(ret - _base)) { SetTempBp(ret, true); return Native.DBG_CONTINUE; }
+            if (ret != 0 && IsCode(ret)) { SetTempBp(ret, true); return Native.DBG_CONTINUE; }
             Trap(ref ctx, hThread); return Native.DBG_CONTINUE;
         }
         if (inText && newLine) return Stop(ref ctx, hThread, 0);
@@ -324,8 +346,8 @@ public sealed class DebugSession
         return Native.DBG_CONTINUE;
     }
 
-    bool RetInProc(uint ret) => ret != 0 && _pe.IsCodeRva(ret - _base)
-                                && (ret - _base) >= _stepLo && (ret - _base) < _stepHi;
+    // _stepLo/_stepHi are absolute VAs, so a return address in another module compares correctly.
+    bool RetInProc(uint ret) => ret != 0 && IsCode(ret) && ret >= _stepLo && ret < _stepHi;
 
     Native.CONTEXT GetCtx(IntPtr hThread)
     { var c = new Native.CONTEXT { ContextFlags = Native.CONTEXT_FULL }; Native.GetThreadContext(hThread, ref c); return c; }
@@ -344,37 +366,6 @@ public sealed class DebugSession
         if (overReturn) _overReturns.Add(va);
     }
 
-    void ArmBreakpoints()
-    {
-        lock (_bpLock)
-            foreach (var bp in RequestedBreaks)
-                if (bp.Enabled) Arm(bp);
-    }
-
-    uint? ResolveVa(Breakpoint bp)
-    {
-        if (bp.Rva != 0) return _base + bp.Rva;
-        var rva = _info.LineToRva(bp.Line, bp.Module);
-        return rva is uint r ? _base + r : null;
-    }
-
-    /// <summary>Place the 0xCC for a breakpoint and register its metadata. Caller holds _bpLock.</summary>
-    void Arm(Breakpoint bp)
-    {
-        if (ResolveVa(bp) is not uint va) { Log?.Invoke($"No code for {bp.Where}."); return; }
-        _bpByVa[va] = bp;
-        if (!_breakpoints.ContainsKey(va)) { _breakpoints[va] = ReadByte(va); WriteByte(va, 0xCC); }
-        Log?.Invoke($"Breakpoint armed: {bp.Where} @ 0x{va:X8}");
-    }
-
-    /// <summary>Restore the original byte and unregister a breakpoint. Caller holds _bpLock.</summary>
-    void Disarm(Breakpoint bp)
-    {
-        if (ResolveVa(bp) is not uint va) return;
-        if (_breakpoints.TryGetValue(va, out var orig)) { WriteByte(va, orig); _breakpoints.Remove(va); }
-        _bpByVa.Remove(va);
-    }
-
     /// <summary>Add/remove/toggle a breakpoint on a live process (safe while running or stopped).</summary>
     public void AddBreakpointLive(Breakpoint bp)
     { lock (_bpLock) if (_hProcess != IntPtr.Zero && bp.Enabled) Arm(bp); }
@@ -391,7 +382,7 @@ public sealed class DebugSession
     /// <summary>Run until execution reaches a source line (one-shot), then stop.</summary>
     public void RunTo(string module, int line)
     {
-        if (_info.LineToRva(line, module) is uint r) _pendingTemp = _base + r;
+        if (ResolveLineAbs(module, line) is uint va) _pendingTemp = va;
         Continue();
     }
 
@@ -399,13 +390,12 @@ public sealed class DebugSession
 
     void ReportStop(Native.CONTEXT ctx, string reason)
     {
-        uint eipRva = ctx.Eip - _base;
-        var loc = _info.Locate(eipRva);
+        var loc = LocateAt(ctx.Eip);
         var stack = WalkStack(ctx);
 
         var globals = new List<VarValue>();
-        foreach (var g in _info.Globals)
-            globals.Add(ReadVar(g.Name, _base + g.Rva, g.Type, g.DisplaySize, g.Threaded));
+        foreach (var (m, g) in StopGlobals(ctx.Eip))
+            globals.Add(ReadVar(g.Name, m.LoadBase + g.Rva, g.Type, g.DisplaySize, g.Threaded));
 
         Stopped?.Invoke(new StopInfo(ctx.Eip, loc?.Module, loc?.Line, stack, globals,
                                      stack[0].Locals, BuildThreads(), _stoppedTid, reason));
@@ -436,9 +426,9 @@ public sealed class DebugSession
         {
             Native.CONTEXT c;
             try { c = GetCtx(kv.Value); } catch { continue; }
-            uint rva = c.Eip - _base;
-            string where = _pe.IsCodeRva(rva)
-                ? (_info.ProcContaining(rva)?.Name ?? $"0x{c.Eip:X8}")
+            var m = ModuleAt(c.Eip);
+            string where = m?.IsDebuggableCode(c.Eip) == true
+                ? (m.Info!.ProcContaining(c.Eip - m.LoadBase)?.Name ?? $"0x{c.Eip:X8}")
                 : $"[runtime] 0x{c.Eip:X8}";
             string mark = kv.Key == _stoppedTid ? "►" : "  ";
             list.Add(new ThreadRef(kv.Key, $"{mark} Thread {kv.Key}   {where}"));
@@ -484,18 +474,18 @@ public sealed class DebugSession
     /// <summary>Resolve a variable name to its display value, current frame first then globals.</summary>
     string? ResolveVar(string name, Native.CONTEXT ctx)
     {
-        uint rva = ctx.Eip - _base;
-        if (_pe.IsCodeRva(rva) && _info.ProcContaining(rva) is { } proc)
+        var m = ModuleAt(ctx.Eip);
+        if (m?.IsDebuggableCode(ctx.Eip) == true && m.Info!.ProcContaining(ctx.Eip - m.LoadBase) is { } proc)
             foreach (var lv in proc.Locals)
                 if (string.Equals(lv.Name, name, StringComparison.OrdinalIgnoreCase))
                 {
-                    uint va = lv.IsStatic ? _base + lv.Rva : (uint)((long)ctx.Ebp + lv.FrameOffset);
+                    uint va = lv.IsStatic ? m.LoadBase + lv.Rva : (uint)((long)ctx.Ebp + lv.FrameOffset);
                     int sz = lv.Type.Size > 0 ? lv.Type.Size : lv.DisplaySize;
                     return CleanVal(ReadVar(lv.Name, va, lv.Type, sz, lv.Threaded).Display);
                 }
-        foreach (var g in _info.Globals)
+        foreach (var (gm, g) in AllGlobals())
             if (string.Equals(g.Name, name, StringComparison.OrdinalIgnoreCase))
-                return CleanVal(ReadVar(g.Name, _base + g.Rva, g.Type, g.DisplaySize, g.Threaded).Display);
+                return CleanVal(ReadVar(g.Name, gm.LoadBase + g.Rva, g.Type, g.DisplaySize, g.Threaded).Display);
         return null;
     }
 
@@ -513,19 +503,19 @@ public sealed class DebugSession
     {
         if (frameIndex >= 0 && frameIndex < _liveFrames.Count)
         {
-            var (ebp, rva) = _liveFrames[frameIndex];
-            if (_pe.IsCodeRva(rva) && _info.ProcContaining(rva) is { } proc)
+            var (ebp, m, rva) = _liveFrames[frameIndex];
+            if (m?.Info != null && m.Pe!.IsCodeRva(rva) && m.Info.ProcContaining(rva) is { } proc)
                 foreach (var lv in proc.Locals)
                     if (string.Equals(lv.Name, name, StringComparison.OrdinalIgnoreCase))
                     {
-                        uint va = lv.IsStatic ? _base + lv.Rva : (uint)((long)ebp + lv.FrameOffset);
+                        uint va = lv.IsStatic ? m.LoadBase + lv.Rva : (uint)((long)ebp + lv.FrameOffset);
                         int sz = lv.Type.Size > 0 ? lv.Type.Size : lv.DisplaySize;
                         return (va, lv.Type, sz, lv.Threaded, lv.Name);
                     }
         }
-        foreach (var g in _info.Globals)
+        foreach (var (gm, g) in AllGlobals())
             if (string.Equals(g.Name, name, StringComparison.OrdinalIgnoreCase))
-                return (_base + g.Rva, g.Type, g.DisplaySize, g.Threaded, g.Name);
+                return (gm.LoadBase + g.Rva, g.Type, g.DisplaySize, g.Threaded, g.Name);
         return null;
     }
 
@@ -580,12 +570,13 @@ public sealed class DebugSession
         string n, string[] parts, int frameIndex, string name)
     {
         if (frameIndex < 0 || frameIndex >= _liveFrames.Count) return null;
-        var (ebp, rva) = _liveFrames[frameIndex];
-        var proc = _pe.IsCodeRva(rva) ? _info.ProcContaining(rva) : null;
+        var (ebp, m, rva) = _liveFrames[frameIndex];
+        if (m?.Info == null) return null;
+        var proc = m.Pe!.IsCodeRva(rva) ? m.Info.ProcContaining(rva) : null;
         var q = proc?.Locals.FirstOrDefault(l => l.Name.Equals($"QUEUE:BROWSE:{n}", StringComparison.OrdinalIgnoreCase));
-        if (q == null || _info.GroupTypeForRef(q.TypeRef, 0) is not { } qtype) return null;
+        if (q == null || m.Info.GroupTypeForRef(q.TypeRef, 0) is not { } qtype) return null;
 
-        uint handleVa = q.IsStatic ? _base + q.Rva : (uint)((long)ebp + q.FrameOffset);
+        uint handleVa = q.IsStatic ? m.LoadBase + q.Rva : (uint)((long)ebp + q.FrameOffset);
         uint buf = ReadU32(handleVa);                  // &QUEUE reference → element buffer
         if (buf == 0) return null;
 
@@ -633,17 +624,17 @@ public sealed class DebugSession
     {
         // globals first: a flat field name like STU:LastName means the file-record buffer, not a
         // local queue copy of the same field.
-        foreach (var gl in _info.Globals)
+        foreach (var (gm, gl) in AllGlobals())
             if (gl.Type.Kind == TypeKind.Group)
-                yield return (_base + gl.Rva, gl.Type, gl.Threaded);
+                yield return (gm.LoadBase + gl.Rva, gl.Type, gl.Threaded);
 
         if (frameIndex >= 0 && frameIndex < _liveFrames.Count)
         {
-            var (ebp, rva) = _liveFrames[frameIndex];
-            if (_pe.IsCodeRva(rva) && _info.ProcContaining(rva) is { } proc)
+            var (ebp, m, rva) = _liveFrames[frameIndex];
+            if (m?.Info != null && m.Pe!.IsCodeRva(rva) && m.Info.ProcContaining(rva) is { } proc)
                 foreach (var lv in proc.Locals)
                     if (lv.Type.Kind == TypeKind.Group)
-                        yield return (lv.IsStatic ? _base + lv.Rva : (uint)((long)ebp + lv.FrameOffset), lv.Type, lv.Threaded);
+                        yield return (lv.IsStatic ? m.LoadBase + lv.Rva : (uint)((long)ebp + lv.FrameOffset), lv.Type, lv.Threaded);
         }
     }
 
@@ -681,26 +672,27 @@ public sealed class DebugSession
         return false;
     }
 
-    readonly List<(uint Ebp, uint Rva)> _liveFrames = new();   // for live re-reading while running
+    readonly List<(uint Ebp, LoadedModule? Mod, uint Rva)> _liveFrames = new();   // for live re-reading while running
 
     Frame MakeFrame(uint addr, uint frameEbp)
     {
-        uint rva = addr - _base;
-        bool code = _pe.IsCodeRva(rva);
-        var l = code ? _info.Locate(rva) : null;
-        _liveFrames.Add((frameEbp, rva));
-        return new Frame(FrameLabel(rva, addr), addr, l?.Module, l?.Line, ReadProcLocals(frameEbp, rva));
+        var m = ModuleAt(addr);
+        uint rva = m != null ? addr - m.LoadBase : addr;
+        bool code = m?.IsDebuggableCode(addr) ?? false;
+        var l = code ? m!.Info!.Locate(rva) : null;
+        _liveFrames.Add((frameEbp, m, rva));
+        return new Frame(FrameLabel(m, addr), addr, l?.Module, l?.Line, ReadProcLocals(frameEbp, m, rva));
     }
 
-    List<VarValue> ReadProcLocals(uint frameEbp, uint rva)
+    List<VarValue> ReadProcLocals(uint frameEbp, LoadedModule? m, uint rva)
     {
         var locals = new List<VarValue>();
-        if (!_pe.IsCodeRva(rva)) return locals;
-        var proc = _info.ProcContaining(rva);
+        if (m?.Info == null || !m.Pe!.IsCodeRva(rva)) return locals;
+        var proc = m.Info.ProcContaining(rva);
         if (proc != null)
             foreach (var lv in proc.Locals)
             {
-                uint va = lv.IsStatic ? _base + lv.Rva : (uint)((long)frameEbp + lv.FrameOffset);
+                uint va = lv.IsStatic ? m.LoadBase + lv.Rva : (uint)((long)frameEbp + lv.FrameOffset);
                 int sz = lv.Type.Size > 0 ? lv.Type.Size : lv.DisplaySize;
                 locals.Add(ReadVar(lv.Name, va, lv.Type, sz, lv.Threaded));
             }
@@ -713,16 +705,17 @@ public sealed class DebugSession
     {
         if (_hProcess == IntPtr.Zero || frameIndex < 0 || frameIndex >= _liveFrames.Count)
             return Array.Empty<VarValue>();
-        var (ebp, rva) = _liveFrames[frameIndex];
-        return ReadProcLocals(ebp, rva);
+        var (ebp, m, rva) = _liveFrames[frameIndex];
+        return ReadProcLocals(ebp, m, rva);
     }
 
     public IReadOnlyList<VarValue> RereadGlobals()
     {
         if (_hProcess == IntPtr.Zero) return Array.Empty<VarValue>();
+        uint eip = _stoppedTid != 0 && _threads.TryGetValue(_stoppedTid, out var h) ? GetCtx(h).Eip : 0;
         var list = new List<VarValue>();
-        foreach (var g in _info.Globals)
-            list.Add(ReadVar(g.Name, _base + g.Rva, g.Type, g.DisplaySize, g.Threaded));
+        foreach (var (m, g) in StopGlobals(eip))
+            list.Add(ReadVar(g.Name, m.LoadBase + g.Rva, g.Type, g.DisplaySize, g.Threaded));
         return list;
     }
 
@@ -834,10 +827,10 @@ public sealed class DebugSession
         return Native.WriteProcessMemory(_hProcess, (IntPtr)addr, bytes, bytes.Length, out _);
     }
 
-    string FrameLabel(uint rva, uint absAddr)
+    string FrameLabel(LoadedModule? m, uint absAddr)
     {
-        if (!_pe.IsCodeRva(rva)) return $"[runtime]  0x{absAddr:X8}";
-        var p = _info.ProcContaining(rva);
+        if (m?.Info == null || !m.IsDebuggableCode(absAddr)) return $"[runtime]  0x{absAddr:X8}";
+        var p = m.Info.ProcContaining(absAddr - m.LoadBase);
         return p != null ? p.Name : $"0x{absAddr:X8}";
     }
 
@@ -876,7 +869,7 @@ public sealed class DebugSession
                 ? BitConverter.ToString(code, off, len).Replace("-", " ") : "";
             // source annotation: only when the line changes (mirrors how the source view groups bytes)
             string? src = null;
-            var loc = _pe.IsCodeRva(ip - _base) ? _info.Locate(ip - _base) : null;
+            var loc = LocateAt(ip);
             if (loc is { } l) { var tag = $"{l.Module}:{l.Line}"; if (tag != lastSrc) { src = tag; lastSrc = tag; } }
             lines.Add(new DisasmLine(ip, bytes, output.ToStringAndReset(), src));
         }
@@ -891,10 +884,10 @@ public sealed class DebugSession
     public bool SetNextStatement(string module, int line)
     {
         if (_hProcess == IntPtr.Zero) return false;
-        if (_info.LineToRva(line, module) is not uint rva) return false;
+        if (ResolveLineAbs(module, line) is not uint va) return false;
         if (!_threads.TryGetValue(_stoppedTid, out var h)) return false;
         var ctx = GetCtx(h);
-        ctx.Eip = _base + rva;
+        ctx.Eip = va;
         if (!Native.SetThreadContext(h, ref ctx)) return false;
         ReportStop(ctx, "set next statement");   // re-report so the UI moves the current line + re-reads
         return true;

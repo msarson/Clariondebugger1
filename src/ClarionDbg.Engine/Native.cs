@@ -80,6 +80,11 @@ internal static class Native
     [DllImport("kernel32.dll", SetLastError = true)]
     public static extern bool TerminateProcess(IntPtr h, uint code);
 
+    // Resolve the on-disk path of a DLL from the hFile handed to us in a LOAD_DLL_DEBUG_EVENT,
+    // so we can parse that module's own PE + TSWD blob off disk.
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    public static extern uint GetFinalPathNameByHandle(IntPtr hFile, System.Text.StringBuilder buf, uint cch, uint flags);
+
     [DllImport("kernel32.dll", SetLastError = true)]
     public static extern bool DebugActiveProcess(uint pid);
     [DllImport("kernel32.dll", SetLastError = true)]

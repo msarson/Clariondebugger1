@@ -10,6 +10,7 @@ public sealed class PeImage
     public byte[] Raw { get; }
     public uint PreferredBase { get; }
     public uint EntryRva { get; }
+    public uint SizeOfImage { get; }     // total mapped span — defines [LoadBase, LoadBase+SizeOfImage)
     public IReadOnlyList<Section> Sections { get; }
 
     public PeImage(string path)
@@ -22,6 +23,7 @@ public sealed class PeImage
         int opt = coff + 20;
         EntryRva = BinaryPrimitives.ReadUInt32LittleEndian(Raw.AsSpan(opt + 16));
         PreferredBase = BinaryPrimitives.ReadUInt32LittleEndian(Raw.AsSpan(opt + 28)); // ImageBase (PE32)
+        SizeOfImage = BinaryPrimitives.ReadUInt32LittleEndian(Raw.AsSpan(opt + 56));   // SizeOfImage (PE32)
         int sectbl = opt + optSize;
         var secs = new List<Section>();
         for (int i = 0; i < nsec; i++)
@@ -35,6 +37,14 @@ public sealed class PeImage
                 BinaryPrimitives.ReadUInt32LittleEndian(Raw.AsSpan(o + 16))));
         }
         Sections = secs;
+    }
+
+    /// <summary>Best-effort load — returns null instead of throwing for absent/malformed images
+    /// (a DLL discovered at runtime may be unreadable, packed, or a stub).</summary>
+    public static PeImage? TryLoad(string path)
+    {
+        try { return new PeImage(path); }
+        catch { return null; }
     }
 
     public Section? FindSection(string name) =>
