@@ -215,6 +215,7 @@ public sealed partial class DebugSession
         uint exCode = U32(buf, 12);
         uint exAddr = U32(buf, 24);
         _stoppedTid = tid;
+        _eventTid = tid;   // the tid the top-level loop will ContinueDebugEvent — func-eval must pair to this
         var hThread = _threads.TryGetValue(tid, out var h) ? h : _hThread;
 
         // ---- single-step (stepping or breakpoint re-arm) ----
@@ -344,7 +345,18 @@ public sealed partial class DebugSession
         _stepping = StepKind.None;
         _pauseRequested = false;   // any stop consumes a pending pause (a breakpoint may have fired first)
         ReportStop(ctx, reason ?? (userBpAddr != 0 ? "breakpoint" : "step"));
-        _resume.WaitOne();
+        // A threaded func-eval continues + re-catches the held debug event, so it's only safe when we're
+        // stopped ON that event's thread — true for breakpoint/step stops, but NOT a pause (which reports
+        // a different thread than the injected break landed on). Gate eval to event-thread stops.
+        _canEval = _stoppedTid == _eventTid;
+        // wait for the next action; a threaded func-eval runs inline and we keep waiting (stay stopped)
+        while (true)
+        {
+            _resume.WaitOne();
+            if (_act != Act.Eval) break;
+            DoFuncEval(hThread);
+        }
+        _canEval = false;
         if (_act == Act.Terminate) { Native.TerminateProcess(_hProcess, 0); return Native.DBG_CONTINUE; }
 
         ctx = GetCtx(hThread);
@@ -443,6 +455,8 @@ public sealed partial class DebugSession
     }
 
     uint _stoppedTid;
+    uint _eventTid;             // tid of the debug event the top-level loop is holding (acks it on resume)
+    volatile bool _canEval;     // true only while parked in Stop() on the event's own thread (func-eval safe)
 
     void ReportStop(Native.CONTEXT ctx, string reason)
     {

@@ -30,6 +30,11 @@ public sealed partial class DebugSession
     public uint? ResolveThreadInstance(uint templateVa)
     {
         if (_hProcess == IntPtr.Zero) return null;
+        if (!_canEval)   // not parked at a breakpoint/step stop on the event's own thread (e.g. after a pause)
+        {
+            Log?.Invoke("Threaded resolve is only available at a breakpoint/step stop (set a breakpoint and run to it).");
+            return null;
+        }
         var owner = ModuleForThreadedVa(templateVa);
         if (owner == null || !owner.HasThreadedData) return null;
         uint helper = ReadDword(owner.LoadBase + owner.ThrGetInstanceIatRva);
