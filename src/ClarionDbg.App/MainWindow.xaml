@@ -133,7 +133,8 @@
                                                    FontFamily="Consolas" FontSize="13" TextAlignment="Right" Margin="0,0,8,0"/>
                                         <TextBlock Grid.Column="2" local:SyntaxHighlight.Text="{Binding Text}"
                                                    Foreground="{StaticResource Fg}"
-                                                   FontFamily="Consolas" FontSize="13" TextWrapping="NoWrap"/>
+                                                   FontFamily="Consolas" FontSize="13" TextWrapping="NoWrap"
+                                                   MouseMove="SourceText_MouseMove" MouseLeave="SourceText_MouseLeave"/>
                                     </Grid>
                                 </Border>
                             </DataTemplate>

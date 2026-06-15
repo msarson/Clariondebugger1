@@ -518,12 +518,106 @@ public partial class MainWindow : Window
         Status($"{p.Name} → {l.Module}:{l.Line}. Click the gutter there to set a breakpoint.");
     }
 
+    // ---------- source data tips (hover a variable to see its live value) ----------
+    System.Windows.Controls.ToolTip? _dataTip;
+    double _srcCharWidth;
+    string? _dataTipWord;
+
+    // width of one character in the source font; the source view is monospace (Consolas 13),
+    // so column-under-cursor = mouseX / charWidth is exact.
+    double SourceCharWidth()
+    {
+        if (_srcCharWidth > 0) return _srcCharWidth;
+        var dpi = VisualTreeHelper.GetDpi(this).PixelsPerDip;
+        var ft = new System.Windows.Media.FormattedText(new string('0', 20),
+            System.Globalization.CultureInfo.InvariantCulture, FlowDirection.LeftToRight,
+            new Typeface("Consolas"), 13, Brushes.Black, dpi);
+        _srcCharWidth = ft.WidthIncludingTrailingWhitespace / 20.0;
+        return _srcCharWidth;
+    }
+
+    static bool IsIdentChar(char c) => char.IsLetterOrDigit(c) || c is '_' or ':' or '.';
+
+    // extract the Clarion identifier (incl. LOC:Name / Que.Field) under the given column
+    static string? WordAt(string text, int col)
+    {
+        if (col < 0 || col >= text.Length || !IsIdentChar(text[col])) return null;
+        int s = col, e = col;
+        while (s > 0 && IsIdentChar(text[s - 1])) s--;
+        while (e < text.Length - 1 && IsIdentChar(text[e + 1])) e++;
+        var w = text.Substring(s, e - s + 1).Trim('.', ':');
+        return w.Length > 0 && !char.IsDigit(w[0]) ? w : null;
+    }
+
+    void SourceText_MouseMove(object sender, MouseEventArgs e)
+    {
+        if (_session == null || _state == State.Idle) { HideDataTip(); return; }
+        if (sender is not System.Windows.Controls.TextBlock tb || tb.DataContext is not SourceLine sl)
+        { HideDataTip(); return; }
+
+        int col = (int)(e.GetPosition(tb).X / SourceCharWidth());
+        var word = WordAt(sl.Text, col);
+        if (word == null) { HideDataTip(); return; }
+        if (word == _dataTipWord && _dataTip?.IsOpen == true) return;   // already showing this word
+
+        int frame = LstStack.SelectedIndex < 0 ? 0 : LstStack.SelectedIndex;
+        DebugSession.VarValue? v;
+        try { v = _session.EvalWatch(word, frame); } catch { v = null; }
+        if (v == null || v.Display is "<not found>" or "<error>") { HideDataTip(); return; }
+
+        _dataTipWord = word;
+        string type = LookupDeclType(_curModule, v.Name) ?? v.TypeName;
+        string body = v.Display;
+        if (TryFormatClarionDateTime(type, v.Display, out var pretty)) body = $"{pretty}   (raw {v.Display})";
+        ShowDataTip(word, type, body, v.Full);
+    }
+
+    void SourceText_MouseLeave(object sender, MouseEventArgs e) => HideDataTip();
+
+    void ShowDataTip(string name, string type, string value, string full)
+    {
+        _dataTip ??= new System.Windows.Controls.ToolTip
+        {
+            Placement = System.Windows.Controls.Primitives.PlacementMode.Mouse,
+            Background = new SolidColorBrush(Color.FromRgb(0x1E, 0x1E, 0x1E)),
+            BorderBrush = (Brush)(TryFindResource("Border") ?? Brushes.Gray),
+            BorderThickness = new Thickness(1),
+            Padding = new Thickness(8, 5, 8, 5)
+        };
+        var fg = (Brush)(TryFindResource("Fg") ?? Brushes.White);
+        var dim = (Brush)(TryFindResource("FgDim") ?? Brushes.Gray);
+        var panel = new System.Windows.Controls.StackPanel();
+        panel.Children.Add(new System.Windows.Controls.TextBlock
+        { Text = $"{name}  :  {type}", Foreground = dim, FontFamily = new FontFamily("Consolas"), FontSize = 11 });
+        panel.Children.Add(new System.Windows.Controls.TextBlock
+        {
+            Text = value, Foreground = fg, FontFamily = new FontFamily("Consolas"), FontSize = 14,
+            FontWeight = FontWeights.SemiBold, TextWrapping = TextWrapping.Wrap, MaxWidth = 520
+        });
+        if (!string.IsNullOrEmpty(full) && full != value && !full.StartsWith(value))
+            panel.Children.Add(new System.Windows.Controls.TextBlock
+            {
+                Text = full, Foreground = dim, FontFamily = new FontFamily("Consolas"), FontSize = 11,
+                TextWrapping = TextWrapping.Wrap, MaxWidth = 520, Margin = new Thickness(0, 3, 0, 0)
+            });
+        _dataTip.Content = panel;
+        _dataTip.IsOpen = false;   // re-open so it repositions at the current cursor
+        _dataTip.IsOpen = true;
+    }
+
+    void HideDataTip()
+    {
+        if (_dataTip != null) _dataTip.IsOpen = false;
+        _dataTipWord = null;
+    }
+
     // ---------- helpers ----------
     void ClearCurrentLine() { foreach (var l in _lines) if (l.IsCurrent) l.IsCurrent = false; }
 
     void SetState(State s)
     {
         _state = s;
+        HideDataTip();
         BtnGo.IsEnabled = s != State.Running;
         BtnStop.IsEnabled = s != State.Idle;
         BtnStepOver.IsEnabled = BtnStepInto.IsEnabled = BtnStepOut.IsEnabled = s == State.Stopped;
