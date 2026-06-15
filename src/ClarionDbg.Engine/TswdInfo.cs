@@ -13,6 +13,7 @@ public sealed class TswdSymbol
     public int DisplaySize = 4; // bytes to show when the type isn't fully decoded
     public bool Threaded;       // lives in .cwtls (Clarion thread-local)
     public bool IsStatic;       // local statically allocated at an RVA (threaded proc) vs EBP-relative
+    public int TypeRef;         // blob ref of the type record (used to attach FILE/QUEUE/GROUP member layouts)
 }
 
 public sealed class TswdProc
@@ -128,6 +129,7 @@ public sealed class TswdInfo
     void ScanSymbols(PeImage pe)
     {
         _pe = pe;
+        ScanMembers();
         int nameSz = _symBase - _nameBase;
         var seenProc = new HashSet<uint>();
         var seenGlobal = new HashSet<uint>();
@@ -194,6 +196,13 @@ public sealed class TswdInfo
             g.DisplaySize = Math.Max(sz, 1);
         }
 
+        // attach FILE-record / GROUP member layouts to globals whose type wasn't decoded
+        // (e.g. STUDENTS$STU:RECORD becomes a GROUP whose members are STU:NUMBER, STU:LASTNAME, …).
+        // Global record buffers are inline at their address, so a member-scope match is decisive.
+        foreach (var g in Globals)
+            if (g.Type.Kind == TypeKind.Unknown && GroupTypeForRef(g.TypeRef, g.DisplaySize) is { } grp)
+            { g.Type = grp; g.DisplaySize = grp.Size; }
+
         ScanLocals();
     }
 
@@ -219,7 +228,7 @@ public sealed class TswdInfo
         int typeRef = (int)RU32(b + 5);
         int nameOff = (int)RU32(b + 9);
         int off = RI32(b + 13);
-        return new TswdSymbol { Name = Name(nameOff), FrameOffset = off, Type = ParseType(typeRef) };
+        return new TswdSymbol { Name = Name(nameOff), FrameOffset = off, Type = ParseType(typeRef), TypeRef = typeRef };
     }
 
     TswdProc ParseProc(int reff)
@@ -255,7 +264,7 @@ public sealed class TswdInfo
             if (!ValidRef(typeRef) || !ValidRef(scope)) continue;
             string nm = Name(nameOff);
             if (!CleanName(nm)) continue;
-            var sym = new TswdSymbol { Name = nm, FrameOffset = off, Type = ParseType(typeRef) };
+            var sym = new TswdSymbol { Name = nm, FrameOffset = off, Type = ParseType(typeRef), TypeRef = typeRef };
             if (!groups.TryGetValue(scope, out var list)) groups[scope] = list = new();
             list.Add((p, sym));
             p += 16;
@@ -285,6 +294,66 @@ public sealed class TswdInfo
                 ordered[i].DisplaySize = Math.Clamp(next - ordered[i].FrameOffset, 1, 512);
             }
         }
+
+        // Note: local record/queue buffers are NOT auto-attached here. A local can be a 4-byte
+        // handle (queue reference) rather than an inline buffer, and frame-gap sizing can't reliably
+        // tell them apart. Inline GROUP locals still decode via ParseType (tag 0x08); browse queues
+        // are resolved on demand by dereferencing (see DebugSession.ResolveBrowseQueue), and file
+        // fields resolve against the global record buffers.
+    }
+
+    // ---- FILE/QUEUE/GROUP member layouts (tag 0x0c records grouped by a shared 'scope' ref) ----
+    readonly Dictionary<int, List<(string Name, int Offset)>> _membersByScope = new();
+
+    void ScanMembers()
+    {
+        int nameSz = _symBase - _nameBase;
+        for (int p = _symBase; p + 17 <= _symEnd; p++)
+        {
+            if (_b[p] != 0x0c) continue;                 // group/structure member record
+            int nameOff = (int)RU32(p + 5);
+            int off = RI32(p + 9);
+            int scope = (int)RU32(p + 13);
+            if (nameOff <= 0 || nameOff >= nameSz || off < 0 || off > 0x40000) continue;
+            string nm = Name(nameOff);
+            if (!CleanName(nm)) continue;
+            if (!_membersByScope.TryGetValue(scope, out var list)) _membersByScope[scope] = list = new();
+            list.Add((nm, off));
+        }
+        foreach (var l in _membersByScope.Values)
+            l.Sort((a, b) => a.Offset != b.Offset ? a.Offset.CompareTo(b.Offset) : string.CompareOrdinal(a.Name, b.Name));
+    }
+
+    // a container links to its member group via its type ref. Observed: FILE records use
+    // scope == typeRef; QUEUEs use scope == typeRef + 5. Restrict to those exact links so an
+    // unrelated nearby group can't be mis-attached (which would show wrong values).
+    int FindScopeForType(int typeRef)
+    {
+        foreach (int s in new[] { typeRef, typeRef + 5 })
+            if (_membersByScope.TryGetValue(s, out var l) && l.Count > 0) return s;
+        return -1;
+    }
+
+    /// <summary>Build a GROUP type (member name + offset, size inferred from offset gaps) for a
+    /// container whose type record is <paramref name="typeRef"/>; null if no member group is found.</summary>
+    public ClaType? GroupTypeForRef(int typeRef, int totalSize)
+    {
+        int scope = FindScopeForType(typeRef);
+        if (scope < 0 || !_membersByScope.TryGetValue(scope, out var mems) || mems.Count == 0) return null;
+        var offsets = mems.Select(m => m.Offset).Distinct().OrderBy(x => x).ToList();
+        int maxOff = offsets[^1];
+        if (totalSize <= maxOff) totalSize = maxOff + 8;          // ensure the last field has room
+        var g = new ClaType { Kind = TypeKind.Group, Size = totalSize };
+        var seen = new HashSet<int>();
+        foreach (var m in mems)
+        {
+            if (!seen.Add(m.Offset)) continue;                   // first field at each offset (OVER aliases ignored)
+            int nextOff = totalSize;
+            foreach (var o in offsets) if (o > m.Offset) { nextOff = o; break; }
+            int size = Math.Clamp(nextOff - m.Offset, 1, 4096);
+            g.Members.Add(new ClaType.GroupField(m.Name, m.Offset, new ClaType { Kind = TypeKind.Unknown, Size = size }));
+        }
+        return g;
     }
 
     ClaType ParseType(int typeRef)

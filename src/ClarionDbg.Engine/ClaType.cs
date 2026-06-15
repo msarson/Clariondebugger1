@@ -95,6 +95,18 @@ public sealed class ClaType
                 int avail = b.Length - off;
                 if (avail <= 0) return "?";
                 int show = Math.Min(avail, Size > 0 ? Size : 4);
+                // FILE/QUEUE members keep an undecoded type — infer from content so the dump is readable
+                int printable = 0, count = 0;
+                for (int i = 0; i < show; i++) { byte c = b[off + i]; if (c == 0) break; count++; if (c >= 32 && c < 127) printable++; }
+                if (count >= 2 && printable == count)
+                    return "'" + Ascii(b, off, show).TrimEnd('\0', ' ') + "'";
+                if (show is 1 or 2 or 4)
+                    return (show switch
+                    {
+                        1 => b[off],
+                        2 => BinaryPrimitives.ReadUInt16LittleEndian(b.AsSpan(off)),
+                        _ => BinaryPrimitives.ReadUInt32LittleEndian(b.AsSpan(off))
+                    }).ToString();
                 return "0x" + BitConverter.ToString(b, off, show).Replace("-", "");
         }
     }

@@ -69,6 +69,26 @@ a record whose **tag byte is at `SB + ref + 4`** (the 4 bytes before the tag are
               elemTag 0x14 -> STRING(length);  else ARRAY[length] of elem
 ```
 
+## FILE / QUEUE / GROUP member layouts (records & browse queues)
+
+A FILE record, QUEUE, or GROUP buffer is a container whose fields are emitted as **member
+records** — tag `0x0c`, same field layout as a variable (`typeRef@+1`, `nameOff@+5`,
+`offset@+9` = byte offset within the container) plus a **scope** dword at `+13`. All members of
+one container share the same scope value, so grouping `0x0c` records by `+13` reconstructs each
+structure's field list (name + offset), sorted by offset. Field *type* records here are not
+reliably decodable, so element size is inferred from the gap to the next field's offset.
+
+A container links to its member group through its own type ref:
+- **FILE record buffers**: `scope == container.typeRef`. The buffer is a fixed global named
+  `<FILE>$<pre>:RECORD` (e.g. `STUDENTS$STU:RECORD`), so a field address is `buffer_base + offset`.
+- **QUEUEs**: `scope == container.typeRef + 5`. The QUEUE *local* is a 4-byte **handle**, not an
+  inline buffer — dereference it to get the current element buffer, then index with the field
+  group. ABC names the browse queue `QUEUE:BROWSE:<n>` for browse object `BRW<n>`, so
+  `BRW1.Q.STU:LastName` resolves via `QUEUE:BROWSE:1`'s layout at the dereferenced buffer.
+
+(Verified end-to-end against the School ABC app: `STUDENTS$STU:RECORD` → 11 fields at the exact
+dictionary offsets; the BrowseStudents queue → 16 fields incl. `MAJ:Description`, `VIEWPOSITION`.)
+
 ## Value encoding notes
 - **DECIMAL/PDECIMAL**: packed BCD, two digits/byte; a low sign nibble `0x0B/0x0D` = negative.
   Value = digits / 10^places. (Verified: `19.99`, `12.34`, `5.678`.)

@@ -543,15 +543,26 @@ public sealed class DebugSession
         if (name.Contains('.'))
         {
             var parts = name.Split('.', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-            if (parts.Length >= 2 && LocateVar(parts[0], frameIndex) is { } head)
+            if (parts.Length >= 2)
             {
-                uint va = head.Va; ClaType type = head.Type; bool threaded = head.Threaded;
-                for (int i = 1; i < parts.Length; i++)
+                // ABC convention: BRW<n>.Q is the browse queue. Its reference must be dereferenced
+                // (the local is a 4-byte handle) to reach the current element buffer.
+                var bm = System.Text.RegularExpressions.Regex.Match(parts[0], @"^BRW(\d+)$",
+                    System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                if (bm.Success && parts[1].Equals("Q", StringComparison.OrdinalIgnoreCase))
+                    return ResolveBrowseQueue(bm.Groups[1].Value, parts, frameIndex, name);
+
+                // general group member walk (e.g. vGroup.gA, an inline record buffer)
+                if (LocateVar(parts[0], frameIndex) is { } head)
                 {
-                    if (type.Kind != TypeKind.Group || FindField(type, parts[i]) is not { } f) return null;
-                    va = (uint)(va + f.Offset); type = f.Type;
+                    uint va = head.Va; ClaType type = head.Type; bool threaded = head.Threaded; bool ok = true;
+                    for (int i = 1; i < parts.Length; i++)
+                    {
+                        if (type.Kind != TypeKind.Group || FindField(type, parts[i]) is not { } f) { ok = false; break; }
+                        va = (uint)(va + f.Offset); type = f.Type;
+                    }
+                    if (ok) return (va, type, type.Size > 0 ? type.Size : 4, threaded, name);
                 }
-                return (va, type, type.Size > 0 ? type.Size : 4, threaded, name);
             }
         }
 
@@ -562,6 +573,32 @@ public sealed class DebugSession
 
         return null;
     }
+
+    /// <summary>Resolve BRW&lt;n&gt;.Q[.field…]: dereference the browse-queue handle to the current
+    /// element buffer, then index it with the queue's field layout (built on demand).</summary>
+    (uint Va, ClaType Type, int Size, bool Threaded, string Name)? ResolveBrowseQueue(
+        string n, string[] parts, int frameIndex, string name)
+    {
+        if (frameIndex < 0 || frameIndex >= _liveFrames.Count) return null;
+        var (ebp, rva) = _liveFrames[frameIndex];
+        var proc = _pe.IsCodeRva(rva) ? _info.ProcContaining(rva) : null;
+        var q = proc?.Locals.FirstOrDefault(l => l.Name.Equals($"QUEUE:BROWSE:{n}", StringComparison.OrdinalIgnoreCase));
+        if (q == null || _info.GroupTypeForRef(q.TypeRef, 0) is not { } qtype) return null;
+
+        uint handleVa = q.IsStatic ? _base + q.Rva : (uint)((long)ebp + q.FrameOffset);
+        uint buf = ReadU32(handleVa);                  // &QUEUE reference → element buffer
+        if (buf == 0) return null;
+
+        uint va = buf; ClaType type = qtype;
+        for (int i = 2; i < parts.Length; i++)
+        {
+            if (type.Kind != TypeKind.Group || FindField(type, parts[i]) is not { } f) return null;
+            va = (uint)(va + f.Offset); type = f.Type;
+        }
+        return (va, type, type.Size > 0 ? type.Size : 4, false, name);
+    }
+
+    uint ReadU32(uint va) => System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(ReadBytes(va, 4));
 
     // match a member name to a wanted field, tolerating the Clarion prefix being present on only
     // one side: "STU:LastName" ↔ "LastName", "gA" ↔ "gA". Exact (incl. prefix) is preferred.
@@ -594,6 +631,12 @@ public sealed class DebugSession
 
     IEnumerable<(uint Va, ClaType Type, bool Threaded)> GroupRoots(int frameIndex)
     {
+        // globals first: a flat field name like STU:LastName means the file-record buffer, not a
+        // local queue copy of the same field.
+        foreach (var gl in _info.Globals)
+            if (gl.Type.Kind == TypeKind.Group)
+                yield return (_base + gl.Rva, gl.Type, gl.Threaded);
+
         if (frameIndex >= 0 && frameIndex < _liveFrames.Count)
         {
             var (ebp, rva) = _liveFrames[frameIndex];
@@ -602,9 +645,6 @@ public sealed class DebugSession
                     if (lv.Type.Kind == TypeKind.Group)
                         yield return (lv.IsStatic ? _base + lv.Rva : (uint)((long)ebp + lv.FrameOffset), lv.Type, lv.Threaded);
         }
-        foreach (var gl in _info.Globals)
-            if (gl.Type.Kind == TypeKind.Group)
-                yield return (_base + gl.Rva, gl.Type, gl.Threaded);
     }
 
     /// <summary>Evaluate a watch expression (a variable name, or a comparison like "count &gt; 5")

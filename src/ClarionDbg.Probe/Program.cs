@@ -43,6 +43,13 @@ if (bpLine == 0)   // parse-only diagnostic mode
     }
     Console.WriteLine("\nfirst 15 globals (filtered):");
     foreach (var g in info.Globals.Take(15)) Console.WriteLine($"   {g.Name,-24} {g.Type.Describe(),-14} rva=0x{g.Rva:X}");
+    Console.WriteLine("\nglobal GROUP/record buffers (decoded members, first 12):");
+    foreach (var g in info.Globals.Where(g => g.Type.Kind == TypeKind.Group).Take(12))
+    {
+        Console.WriteLine($"   {g.Name,-26} GROUP({g.Type.Members.Count})  rva=0x{g.Rva:X}");
+        foreach (var m in g.Type.Members.Take(20))
+            Console.WriteLine($"        +{m.Offset,-4} {m.Name,-22} size={m.Type.Size}");
+    }
     return;
 }
 Console.WriteLine($"break    : line {bpLine} -> rva 0x{info.LineToRva(bpLine):X}");
