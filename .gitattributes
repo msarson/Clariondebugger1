@@ -1,0 +1,43 @@
+# Normalize line endings. Text is stored LF in the repo and checked out with a
+# platform-appropriate ending; the explicit rules below pin endings where it
+# matters and stop binaries from being mangled.
+* text=auto
+
+# .NET / build sources — CRLF in the working tree (Windows toolchain).
+*.cs        text eol=crlf
+*.csproj    text eol=crlf
+*.cwproj    text eol=crlf
+*.sln       text eol=crlf
+*.xaml      text eol=crlf
+*.ps1       text eol=crlf
+*.iss       text eol=crlf
+
+# Clarion source MUST be CRLF (the compiler requires it — see CLAUDE.md).
+*.clw       text eol=crlf
+*.inc       text eol=crlf
+*.equ       text eol=crlf
+*.int       text eol=crlf
+*.exp       text eol=crlf
+*.red       text eol=crlf
+*.tp[lw]    text eol=crlf
+*.txa       text eol=crlf
+
+# Cross-platform tooling — keep LF.
+*.py        text eol=lf
+*.sh        text eol=lf
+
+# Docs.
+*.md        text
+*.txt       text
+
+# Binaries — never normalize.
+*.exe       binary
+*.dll       binary
+*.lib       binary
+*.obj       binary
+*.tps       binary
+*.dct       binary
+*.ico       binary
+*.bmp       binary
+*.png       binary
+*.hlp       binary
