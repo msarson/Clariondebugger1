@@ -300,9 +300,7 @@ public partial class MainWindow : Window
         foreach (var line in File.ReadAllLines(src))
         {
             var t = line.Replace("\t", "    ");
-            var sl = new SourceLine { LineNo = n, Text = t };
-            sl.HasBreakpoint = LineBp(moduleName, n) != null;
-            _lines.Add(sl);
+            _lines.Add(new SourceLine { LineNo = n, Text = t });
             if (n > 1) sb.Append('\n');
             sb.Append(t);
             n++;
@@ -414,13 +412,11 @@ public partial class MainWindow : Window
         if (_curModule == null || _info == null) return;
         // snap to the nearest line that actually has executable code in this module
         int line = (InfoFor(_curModule) ?? _info).NearestCodeLine(_curModule, clicked) ?? clicked;
-        var sl = _lines.FirstOrDefault(l => l.LineNo == line);
         var existing = LineBp(_curModule, line);
         if (existing != null)
         {
             _bps.Remove(existing);
             _session?.RemoveBreakpointLive(existing);
-            if (sl != null) sl.HasBreakpoint = false;
             Log($"Breakpoint cleared at {_curModule}:{line}.");
         }
         else
@@ -428,7 +424,6 @@ public partial class MainWindow : Window
             var bp = new DebugSession.Breakpoint(_curModule, line);
             _bps.Add(bp);
             _session?.AddBreakpointLive(bp);
-            if (sl != null) sl.HasBreakpoint = true;
             Log(line == clicked
                 ? $"Breakpoint set at {_curModule}:{line}."
                 : $"Breakpoint set at {_curModule}:{line} (no code on line {clicked}; moved to nearest).");
@@ -496,8 +491,6 @@ public partial class MainWindow : Window
         var win = new BreakpointsWindow(_bps, _session) { Owner = this };
         win.ShowDialog();
         // reflect any gutter changes for the current module after edits/removals
-        if (_curModule != null)
-            foreach (var sl in _lines) sl.HasBreakpoint = LineBp(_curModule, sl.LineNo) != null;
         _bpMargin?.Refresh();
         SaveBreakpoints();
     }
@@ -783,21 +776,7 @@ public partial class MainWindow : Window
     // A Popup (not a ToolTip) is used deliberately: WPF only shows ToolTips via its own hover
     // timer, so toggling ToolTip.IsOpen from code is unreliable. A Popup shows on demand.
     System.Windows.Controls.Primitives.Popup? _dataPopup;
-    double _srcCharWidth;
     string? _dataTipWord;
-
-    // width of one character in the source font; the source view is monospace (Consolas 13),
-    // so column-under-cursor = mouseX / charWidth is exact.
-    double SourceCharWidth()
-    {
-        if (_srcCharWidth > 0) return _srcCharWidth;
-        var dpi = VisualTreeHelper.GetDpi(this).PixelsPerDip;
-        var ft = new System.Windows.Media.FormattedText(new string('0', 20),
-            System.Globalization.CultureInfo.InvariantCulture, FlowDirection.LeftToRight,
-            new Typeface("Consolas"), 13, Brushes.Black, dpi);
-        _srcCharWidth = ft.WidthIncludingTrailingWhitespace / 20.0;
-        return _srcCharWidth;
-    }
 
     static bool IsIdentChar(char c) => char.IsLetterOrDigit(c) || c is '_' or ':' or '.';
 
@@ -1407,21 +1386,13 @@ public partial class MainWindow : Window
     }
 }
 
-public sealed class SourceLine : INotifyPropertyChanged
+/// <summary>Per-line metadata for the current module: line number + (tab-expanded) text.
+/// Breakpoint dots and the execution band are drawn by the AvalonEdit margin/renderer,
+/// which read live state — this is just the line-number → text lookup model.</summary>
+public sealed class SourceLine
 {
     public int LineNo { get; set; }
     public string Text { get; set; } = "";
-
-    bool _bp, _cur;
-    public bool HasBreakpoint { get => _bp; set { _bp = value; Raise(nameof(BpVisibility)); } }
-    public bool IsCurrent { get => _cur; set { _cur = value; Raise(nameof(RowBg)); } }
-
-    public Visibility BpVisibility => _bp ? Visibility.Visible : Visibility.Collapsed;
-    public Brush RowBg => _cur ? (Brush)System.Windows.Application.Current.Resources["CurLine"]
-                               : Brushes.Transparent;
-
-    public event PropertyChangedEventHandler? PropertyChanged;
-    void Raise(string p) => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(p));
 }
 
 public sealed class FrameRow
