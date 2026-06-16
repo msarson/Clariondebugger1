@@ -90,10 +90,10 @@ public partial class MainWindow : Window
     void BtnOpen_Click(object sender, RoutedEventArgs e)
     {
         var dlg = new OpenFileDialog { Filter = "Clarion debug EXE (*.exe)|*.exe" };
-        if (dlg.ShowDialog() == true) LoadExe(dlg.FileName);
+        if (dlg.ShowDialog() == true) LoadExe(dlg.FileName, interactive: true);
     }
 
-    void LoadExe(string path)
+    void LoadExe(string path, bool interactive = false)
     {
         try
         {
@@ -104,7 +104,7 @@ public partial class MainWindow : Window
             if (_info == null) { Log("No .cwdebug info — this EXE was not built in Debug mode (vid=full)."); return; }
 
             DiscoverImages(path);     // EXE + sibling Clarion debug DLLs -> _images / _modOwners / _moduleNames
-            InitSourceResolver(path); // redirection/FileList source resolution if an associated .sln is found
+            InitSourceResolver(path, interactive); // redirection/FileList source resolution if an associated .sln is found
 
             _suppressModuleEvent = true;
             CmbModule.ItemsSource = _moduleNames.ToList();
@@ -211,11 +211,12 @@ public partial class MainWindow : Window
         return null;
     }
 
-    /// <summary>Build the source resolver for this EXE: prefer a saved per-solution
-    /// association; otherwise auto-build (in memory, not persisted) from the most
-    /// recent installed Clarion version. Leaves <see cref="_srcResolver"/> null when
-    /// no .sln or no install is found, so ResolveSource falls back to the dir search.</summary>
-    void InitSourceResolver(string exePath)
+    /// <summary>Build the source resolver for this EXE. Order: a saved per-solution
+    /// association; else (when <paramref name="interactive"/>) the link dialog, which
+    /// persists the user's choice; else an in-memory auto-build from the most recent
+    /// installed Clarion version. Leaves <see cref="_srcResolver"/> null when there is
+    /// no .sln or no install, so ResolveSource falls back to the dir search.</summary>
+    void InitSourceResolver(string exePath, bool interactive)
     {
         _srcResolver = null;
         try
@@ -223,24 +224,34 @@ public partial class MainWindow : Window
             var sln = FindSolutionFor(exePath);
             if (sln == null) { Log("No .sln near the EXE — using legacy source search."); return; }
 
+            // 1. Saved association — silent, authoritative.
             var resolver = ClarionSourceResolver.CreateFromAssociation(sln);
+
+            // 2. No association + user-initiated open → ask once, then persist.
+            if (resolver == null && interactive)
+            {
+                var dlg = new LinkSolutionWindow(sln, exePath) { Owner = this };
+                if (dlg.ShowDialog() == true && dlg.Version != null && dlg.Association != null)
+                {
+                    SolutionAssociationStore.Write(dlg.SolutionPath, dlg.Association);
+                    resolver = ClarionSourceResolver.Create(
+                        dlg.SolutionPath, dlg.Version, dlg.PropertiesFile, dlg.Association.ConfigurationOverride);
+                    Log($"Linked {Path.GetFileName(dlg.SolutionPath)} → {dlg.Version.Name}; saved {Path.GetFileName(SolutionAssociationStore.GetSidecarPath(dlg.SolutionPath))}.");
+                }
+            }
+
+            // 3. Fallback (non-interactive, or the user skipped): auto-pick newest install, don't persist.
             if (resolver == null)
             {
-                // No saved association yet — auto-pick the most recent install so
-                // resolution works now. Not persisted: a deliberate version choice
-                // (and sidecar write) belongs to a future first-open dialog.
                 var install = ClarionInstallationDetector.GetMostRecentInstallation();
                 var version = install?.CompilerVersions.FirstOrDefault();
-                if (install != null && version != null)
-                {
-                    resolver = ClarionSourceResolver.Create(sln, version, install.PropertiesPath);
-                    Log($"No saved association for {Path.GetFileName(sln)} — auto-using {version.Name} (not saved).");
-                }
-                else
+                if (install == null || version == null)
                 {
                     Log("No Clarion installation detected — using legacy source search.");
                     return;
                 }
+                resolver = ClarionSourceResolver.Create(sln, version, install.PropertiesPath);
+                Log($"Using {version.Name} for {Path.GetFileName(sln)} (not saved).");
             }
 
             _srcResolver = resolver;
