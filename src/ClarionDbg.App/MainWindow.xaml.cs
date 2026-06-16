@@ -95,6 +95,7 @@ public partial class MainWindow : Window
         Editor.TextArea.TextView.BackgroundRenderers.Add(_curLineRenderer);
         Editor.TextArea.TextView.MouseHover += Editor_MouseHover;
         Editor.TextArea.TextView.MouseHoverStopped += Editor_MouseHoverStopped;
+        ICSharpCode.AvalonEdit.Search.SearchPanel.Install(Editor);   // Ctrl+F find (F3 / Shift+F3 next/prev, Esc closes)
         GridVars.ItemsSource = _vars;
         GridLocals.ItemsSource = _localsRows;
         GridWatch.ItemsSource = _watch;
@@ -1381,8 +1382,27 @@ public partial class MainWindow : Window
             case Key.F11 when (Keyboard.Modifiers & ModifierKeys.Shift) != 0:
                 BtnStepOut_Click(this, new RoutedEventArgs()); e.Handled = true; break;
             case Key.F11: BtnStepInto_Click(this, new RoutedEventArgs()); e.Handled = true; break;
+            case Key.G when (Keyboard.Modifiers & ModifierKeys.Control) != 0:
+                GotoLine(); e.Handled = true; break;
         }
         base.OnKeyDown(e);
+    }
+
+    /// <summary>Ctrl+G — prompt for a line number and jump there (caret + scroll).</summary>
+    void GotoLine()
+    {
+        var doc = Editor.Document;
+        if (doc == null || doc.LineCount <= 0) return;
+        int max = doc.LineCount;
+        var dlg = new GotoLineWindow(Editor.TextArea.Caret.Line, max) { Owner = this };
+        if (dlg.ShowDialog() == true && dlg.LineNumber is int n)
+        {
+            n = Math.Clamp(n, 1, max);
+            Editor.CaretOffset = doc.GetLineByNumber(n).Offset;
+            Editor.ScrollToLine(n);
+            Editor.TextArea.Caret.BringCaretToView();
+            Editor.Focus();
+        }
     }
 }
 
