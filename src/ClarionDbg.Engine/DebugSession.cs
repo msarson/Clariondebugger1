@@ -271,11 +271,18 @@ public sealed partial class DebugSession
             return Native.DBG_CONTINUE;   // initial loader breakpoint etc.
         }
 
-        // ---- a crash (GPF) — stop at the fault so the user can inspect, then let it propagate ----
+        // ---- a crash (GPF) — only break on the SECOND chance (a genuinely unhandled fault) ----
+        // The first chance fires before the app's SEH runs; healthy Clarion programs raise
+        // first-chance access violations that the RTL handles routinely (guard-page probes,
+        // SEH machinery, …). Stopping on those flags normal operation as a crash — which is why
+        // a program that runs fine standalone "crashed" only under this debugger. We therefore
+        // pass first-chance exceptions straight through (DBG_EXCEPTION_NOT_HANDLED, letting the
+        // app's handler try) and only stop if it comes back as second/last chance — i.e. the app
+        // declined it and it's a real, fatal crash. (dwFirstChance follows the 80-byte EXCEPTION_RECORD.)
         if (BreakOnException && IsFatalException(exCode))
         {
-            uint firstChance = U32(buf, 92);   // dwFirstChance follows the 80-byte EXCEPTION_RECORD
-            if (firstChance != 0)
+            uint firstChance = U32(buf, 92);
+            if (firstChance == 0)   // second chance: unhandled → a real crash
             {
                 var ctx = GetCtx(hThread);
                 ReportStop(ctx, $"⚠ {ExceptionName(exCode)} (0x{exCode:X8}) at 0x{exAddr:X8}");
@@ -283,7 +290,7 @@ public sealed partial class DebugSession
                 if (_act == Act.Terminate) { Native.TerminateProcess(_hProcess, 0); return Native.DBG_CONTINUE; }
             }
         }
-        return Native.DBG_EXCEPTION_NOT_HANDLED;   // let the app's handler run (likely terminates)
+        return Native.DBG_EXCEPTION_NOT_HANDLED;   // pass through: first-chance -> app's handler; second-chance -> terminates
     }
 
     /// <summary>The injected pause breakpoint arrived (on a throwaway OS thread). Pick a thread that's
