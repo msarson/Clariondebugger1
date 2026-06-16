@@ -86,7 +86,7 @@ public partial class MainWindow : Window
     public MainWindow()
     {
         InitializeComponent();
-        SourceList.ItemsSource = _lines;
+        Editor.TextArea.TextView.LineTransformers.Add(new ClarionColorizer());  // Clarion syntax colouring
         GridVars.ItemsSource = _vars;
         GridLocals.ItemsSource = _localsRows;
         GridWatch.ItemsSource = _watch;
@@ -282,15 +282,24 @@ public partial class MainWindow : Window
         bool fromDll = img != null && !string.Equals(img, Path.GetFileName(_exePath), StringComparison.OrdinalIgnoreCase);
         TxtSourceName.Text = (src ?? "(source file not found)") + (fromDll ? $"   [{img}]" : "");
         _lines.Clear();
-        if (src == null) { Log($"Source not found for {moduleName} (searched exe dir + Clarion libsrc)."); return; }
+        if (src == null) { Editor.Text = ""; Log($"Source not found for {moduleName} (searched exe dir + Clarion libsrc)."); return; }
+
+        // _lines stays the per-line metadata model (line no. + breakpoint state) used by the
+        // breakpoint margin and current-line renderer; the editor shows the joined text. Tabs
+        // are expanded to 4 spaces so column positions match between the two.
+        var sb = new StringBuilder();
         int n = 1;
         foreach (var line in File.ReadAllLines(src))
         {
-            var sl = new SourceLine { LineNo = n, Text = line.Replace("\t", "    ") };
+            var t = line.Replace("\t", "    ");
+            var sl = new SourceLine { LineNo = n, Text = t };
             sl.HasBreakpoint = LineBp(moduleName, n) != null;
             _lines.Add(sl);
+            if (n > 1) sb.Append('\n');
+            sb.Append(t);
             n++;
         }
+        Editor.Text = sb.ToString();
     }
 
     static readonly string[] SourceSearchDirs =
@@ -425,8 +434,10 @@ public partial class MainWindow : Window
     }
 
     // ---------- run-to-cursor & break-on-procedure-entry ----------
-    static SourceLine? MenuLine(object sender) =>
-        (sender as FrameworkElement)?.DataContext as SourceLine;
+    // The editor context menu acts on the caret's line (left-click to place the caret,
+    // then use the menu). AvalonEdit's Caret.Line is 1-based, matching SourceLine.LineNo.
+    SourceLine? MenuLine(object sender) =>
+        _lines.FirstOrDefault(x => x.LineNo == Editor.TextArea.Caret.Line);
 
     void RunToCursor_Click(object sender, RoutedEventArgs e)
     {
@@ -586,8 +597,7 @@ public partial class MainWindow : Window
         if (info.Line is int line)
         {
             var sl = _lines.FirstOrDefault(x => x.LineNo == line);
-            if (sl != null) { sl.IsCurrent = true; SourceList.UpdateLayout();
-                ((FrameworkElement?)SourceList.ItemContainerGenerator.ContainerFromItem(sl))?.BringIntoView(); }
+            if (sl != null) { sl.IsCurrent = true; Editor.ScrollToLine(sl.LineNo); }
         }
 
         // thread list — mark the stopped thread, let the user switch to inspect another stack
@@ -650,8 +660,7 @@ public partial class MainWindow : Window
             }
             ClearCurrentLine();
             var sl = _lines.FirstOrDefault(x => x.LineNo == fl);
-            if (sl != null) { sl.IsCurrent = true; SourceList.UpdateLayout();
-                ((FrameworkElement?)SourceList.ItemContainerGenerator.ContainerFromItem(sl))?.BringIntoView(); }
+            if (sl != null) { sl.IsCurrent = true; Editor.ScrollToLine(sl.LineNo); }
         }
     }
 
@@ -761,11 +770,7 @@ public partial class MainWindow : Window
             ShowModule(l.Module);
         }
         var sl = _lines.FirstOrDefault(x => x.LineNo == l.Line);
-        if (sl != null)
-        {
-            SourceList.UpdateLayout();
-            ((FrameworkElement?)SourceList.ItemContainerGenerator.ContainerFromItem(sl))?.BringIntoView();
-        }
+        if (sl != null) Editor.ScrollToLine(sl.LineNo);
         Status($"{p.Name} → {l.Module}:{l.Line}. Click the gutter there to set a breakpoint.");
     }
 

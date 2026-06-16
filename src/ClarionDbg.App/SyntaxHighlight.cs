@@ -84,7 +84,10 @@ public static class SyntaxHighlight
             tb.Inlines.Add(new Run(text) { Foreground = brush });
     }
 
-    static IEnumerable<(string, Brush)> Tokenize(string s)
+    /// <summary>Tokenize one line of Clarion source into colored spans. Stateless and
+    /// per-line (multi-line OMIT/COMPILE/strings aren't tracked). Exposed so the AvalonEdit
+    /// colorizer can reuse the exact same vocabulary/precedence as the legacy TextBlock path.</summary>
+    internal static IEnumerable<(string Text, Brush Brush)> Tokenize(string s)
     {
         int i = 0, n = s.Length;
         // a label (or statement) that begins at column 1 with no leading whitespace
