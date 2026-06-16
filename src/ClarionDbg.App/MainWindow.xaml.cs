@@ -514,8 +514,11 @@ public partial class MainWindow : Window
         var dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
                                "ClarionDbg", "breakpoints");
         Directory.CreateDirectory(dir);
+        // Stable per-EXE key. Do NOT use string.GetHashCode() — .NET randomizes it per
+        // process, so the filename differed on every launch and saved breakpoints were
+        // never found again. SlnHash.Compute is a deterministic hash of the path.
         string key = Path.GetFileNameWithoutExtension(_exePath ?? "x") + "_" +
-                     (uint)(_exePath ?? "").ToLowerInvariant().GetHashCode();
+                     SlnHash.Compute(_exePath ?? "");
         return Path.Combine(dir, key + ".json");
     }
 
