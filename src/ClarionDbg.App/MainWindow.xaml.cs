@@ -36,12 +36,21 @@ public partial class MainWindow : Window
     readonly List<ModuleItem> _moduleItems = new();                               // dropdown items: EXE group first, then each DLL, each sorted; DLL modules labelled
     readonly List<string> _siblingDlls = new();                                   // debug DLL paths to PreloadModule onto the session
 
-    /// <summary>A MODULE-dropdown entry. DLL modules render with their owning image
-    /// (e.g. "ABERROR.CLW   [SchoolData.dll]") so the program's own modules stand out.</summary>
-    sealed record ModuleItem(string Name, string Image, bool FromExe)
+    /// <summary>A MODULE-dropdown entry. When the owning solution is known, modules
+    /// that are a project's own <c>Compile</c> source carry <see cref="Project"/> and
+    /// render bare at the top of the list; library/runtime modules render labelled with
+    /// their owning image (e.g. "ABERROR.CLW   [SchoolData.dll]").</summary>
+    sealed record ModuleItem(string Name, string Image, bool FromExe, string? Project = null)
     {
-        public override string ToString() => FromExe ? Name : $"{Name}   [{Image}]";
+        public override string ToString() =>
+            Project != null ? Name                      // your project source: clean, floated to top
+            : FromExe ? Name                            // library compiled into the EXE: no redundant label
+            : $"{Name}   [{Image}]";                    // library from a debug DLL: labelled
     }
+
+    // module filename -> owning project name, from the solution's Compile items.
+    // Empty when no solution is associated (then modules group by image instead).
+    readonly Dictionary<string, string> _projectOfModule = new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>The TSWD blob that owns a source module (the EXE's, a DLL's, or the EXE as fallback).</summary>
     TswdInfo? InfoFor(string? module)
@@ -113,6 +122,7 @@ public partial class MainWindow : Window
 
             DiscoverImages(path);     // EXE + sibling Clarion debug DLLs -> _images / _modOwners / _moduleNames
             InitSourceResolver(path, interactive); // redirection/FileList source resolution if an associated .sln is found
+            BuildModuleItems();       // dropdown items; project source floated to top (needs the resolver's solution)
 
             _suppressModuleEvent = true;
             CmbModule.ItemsSource = _moduleItems.ToList();
@@ -181,20 +191,49 @@ public partial class MainWindow : Window
             foreach (var m in img.Info.Modules)
                 if (m.Lines.Count > 0 && _modOwners.TryAdd(m.Name, (img.Info, img.Name)))
                     _moduleNames.Add(m.Name);
+    }
 
-        // Dropdown items: group by owning image (EXE first, _images[0]), each group
-        // sorted by name. DLL modules carry their image label so a big debug DLL's
-        // modules don't bury the program's own (which now lead the list).
+    /// <summary>Build the MODULE dropdown items. When a solution is associated, the
+    /// project's own source (its <c>Compile</c> items) floats to the top grouped by
+    /// project; library/runtime modules follow, grouped by image. With no solution it
+    /// falls back to EXE-first / per-image grouping. Run AFTER <see cref="InitSourceResolver"/>.</summary>
+    void BuildModuleItems()
+    {
+        _moduleItems.Clear();
+        _projectOfModule.Clear();
+
+        // Classify modules as project source via the solution's Compile items.
+        if (_srcResolver != null)
+            foreach (var proj in _srcResolver.Solution.Projects)
+                foreach (var ci in proj.CompileItems)
+                {
+                    var fn = Path.GetFileName(ci);
+                    if (!string.IsNullOrEmpty(fn)) _projectOfModule[fn] = proj.Name;
+                }
+
+        var items = new List<ModuleItem>();
         for (int i = 0; i < _images.Count; i++)
         {
             var img = _images[i];
             bool fromExe = i == 0;
-            foreach (var n in _moduleNames
-                         .Where(n => _modOwners.TryGetValue(n, out var o) &&
-                                     string.Equals(o.Image, img.Name, StringComparison.OrdinalIgnoreCase))
-                         .OrderBy(n => n, StringComparer.OrdinalIgnoreCase))
-                _moduleItems.Add(new ModuleItem(n, img.Name, fromExe));
+            foreach (var n in _moduleNames.Where(n => _modOwners.TryGetValue(n, out var o) &&
+                                  string.Equals(o.Image, img.Name, StringComparison.OrdinalIgnoreCase)))
+            {
+                _projectOfModule.TryGetValue(n, out var proj);   // null => library/runtime
+                items.Add(new ModuleItem(n, img.Name, fromExe, proj));
+            }
         }
+
+        var ordered = _srcResolver != null
+            ? items.OrderBy(m => m.Project == null ? 1 : 0)                  // project source first
+                   .ThenBy(m => m.Project, StringComparer.OrdinalIgnoreCase) // grouped by project
+                   .ThenBy(m => m.Image, StringComparer.OrdinalIgnoreCase)   // then library grouped by image
+                   .ThenBy(m => m.Name, StringComparer.OrdinalIgnoreCase)
+            : items.OrderBy(m => m.FromExe ? 0 : 1)                          // no solution: EXE first
+                   .ThenBy(m => m.Image, StringComparer.OrdinalIgnoreCase)
+                   .ThenBy(m => m.Name, StringComparer.OrdinalIgnoreCase);
+
+        _moduleItems.AddRange(ordered);
     }
 
     /// <summary>Select a module in the dropdown by name. ModuleItem is a record
