@@ -33,7 +33,15 @@ public partial class MainWindow : Window
     readonly List<LoadedImage> _images = new();                                   // EXE first, then debug DLLs
     readonly Dictionary<string, (TswdInfo Info, string Image)> _modOwners = new(StringComparer.OrdinalIgnoreCase); // .clw -> owning blob
     readonly List<string> _moduleNames = new();                                   // every source module, EXE modules first
+    readonly List<ModuleItem> _moduleItems = new();                               // dropdown items: EXE group first, then each DLL, each sorted; DLL modules labelled
     readonly List<string> _siblingDlls = new();                                   // debug DLL paths to PreloadModule onto the session
+
+    /// <summary>A MODULE-dropdown entry. DLL modules render with their owning image
+    /// (e.g. "ABERROR.CLW   [SchoolData.dll]") so the program's own modules stand out.</summary>
+    sealed record ModuleItem(string Name, string Image, bool FromExe)
+    {
+        public override string ToString() => FromExe ? Name : $"{Name}   [{Image}]";
+    }
 
     /// <summary>The TSWD blob that owns a source module (the EXE's, a DLL's, or the EXE as fallback).</summary>
     TswdInfo? InfoFor(string? module)
@@ -107,7 +115,7 @@ public partial class MainWindow : Window
             InitSourceResolver(path, interactive); // redirection/FileList source resolution if an associated .sln is found
 
             _suppressModuleEvent = true;
-            CmbModule.ItemsSource = _moduleNames.ToList();
+            CmbModule.ItemsSource = _moduleItems.ToList();
             _suppressModuleEvent = false;
 
             _allProcs = _images.SelectMany(img => img.Info.Procedures
@@ -126,7 +134,7 @@ public partial class MainWindow : Window
 
             // show the program's primary module
             string primary = !string.IsNullOrEmpty(_info.SourceFile) ? _info.SourceFile : _moduleNames.FirstOrDefault() ?? "";
-            CmbModule.SelectedItem = primary;     // triggers ShowModule
+            SelectModule(primary);     // triggers ShowModule via SelectionChanged
             if (_bps.Count == 0 && _info.ModuleCount == 1 && primary.Equals("dbgtest.clw", StringComparison.OrdinalIgnoreCase))
                 ToggleBreak(21);                  // demo breakpoint for the bundled sample
             Status($"Loaded {Path.GetFileName(path)}. Pick a module, set breakpoints, press Go.");
@@ -137,7 +145,7 @@ public partial class MainWindow : Window
     void CmbModule_SelectionChanged(object sender, System.Windows.Controls.SelectionChangedEventArgs e)
     {
         if (_suppressModuleEvent) return;
-        if (CmbModule.SelectedItem is string name) ShowModule(name);
+        if (CmbModule.SelectedItem is ModuleItem item) ShowModule(item.Name);
     }
 
     /// <summary>Build the image set and source-module catalog: the EXE (module 0) plus every sibling
@@ -146,7 +154,7 @@ public partial class MainWindow : Window
     /// discovers and attributes them at runtime). EXE modules win any name collision.</summary>
     void DiscoverImages(string exePath)
     {
-        _images.Clear(); _modOwners.Clear(); _moduleNames.Clear(); _siblingDlls.Clear();
+        _images.Clear(); _modOwners.Clear(); _moduleNames.Clear(); _moduleItems.Clear(); _siblingDlls.Clear();
         _images.Add(new LoadedImage(exePath, Path.GetFileName(exePath), _pe!, _info!));
 
         var dir = Path.GetDirectoryName(Path.GetFullPath(exePath));
@@ -170,6 +178,28 @@ public partial class MainWindow : Window
             foreach (var m in img.Info.Modules)
                 if (m.Lines.Count > 0 && _modOwners.TryAdd(m.Name, (img.Info, img.Name)))
                     _moduleNames.Add(m.Name);
+
+        // Dropdown items: group by owning image (EXE first, _images[0]), each group
+        // sorted by name. DLL modules carry their image label so a big debug DLL's
+        // modules don't bury the program's own (which now lead the list).
+        for (int i = 0; i < _images.Count; i++)
+        {
+            var img = _images[i];
+            bool fromExe = i == 0;
+            foreach (var n in _moduleNames
+                         .Where(n => _modOwners.TryGetValue(n, out var o) &&
+                                     string.Equals(o.Image, img.Name, StringComparison.OrdinalIgnoreCase))
+                         .OrderBy(n => n, StringComparer.OrdinalIgnoreCase))
+                _moduleItems.Add(new ModuleItem(n, img.Name, fromExe));
+        }
+    }
+
+    /// <summary>Select a module in the dropdown by name. ModuleItem is a record
+    /// (value equality), so this matches the bound item regardless of its label.</summary>
+    void SelectModule(string? name)
+    {
+        CmbModule.SelectedItem = name == null ? null
+            : _moduleItems.FirstOrDefault(it => string.Equals(it.Name, name, StringComparison.OrdinalIgnoreCase));
     }
 
     void ShowModule(string moduleName)
@@ -475,7 +505,7 @@ public partial class MainWindow : Window
         if (info.Module != null && info.Module != _curModule)
         {
             _suppressModuleEvent = true;
-            CmbModule.SelectedItem = info.Module;
+            SelectModule(info.Module);
             _suppressModuleEvent = false;
             ShowModule(info.Module);
         }
@@ -543,7 +573,7 @@ public partial class MainWindow : Window
         {
             if (f.Module != _curModule)
             {
-                _suppressModuleEvent = true; CmbModule.SelectedItem = f.Module; _suppressModuleEvent = false;
+                _suppressModuleEvent = true; SelectModule(f.Module); _suppressModuleEvent = false;
                 ShowModule(f.Module);
             }
             ClearCurrentLine();
@@ -654,7 +684,7 @@ public partial class MainWindow : Window
         if (l.Module != _curModule)
         {
             _suppressModuleEvent = true;
-            CmbModule.SelectedItem = l.Module;
+            SelectModule(l.Module);
             _suppressModuleEvent = false;
             ShowModule(l.Module);
         }
