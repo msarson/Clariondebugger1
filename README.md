@@ -72,8 +72,9 @@ ABC application — `School`, 54 modules):
 - **Disassembly view** — an x86 disassembly window (powered by Iced) at the current instruction
   pointer, with byte columns, source-line annotations, and the current instruction highlighted;
   navigate to any address, auto-follows the IP.
-- **Syntax highlighting** — the source view colorizes Clarion keywords, strings, comments,
-  numbers, and column-1 labels (professional palette, no purple).
+- **Code editor (AvalonEdit)** — the source view is an AvalonEdit editor: Clarion syntax
+  colorizing (keywords, strings, comments, numbers, column-1 labels — professional palette, no
+  purple), a breakpoint margin/gutter, current-line highlight, and **Go to line** (Ctrl+G).
 - **Array (DIM) viewer** — right-click a `DIM(...)` variable → *View as array* lists each element
   with its address and value.
 - **Memory / hex view** — right-click a variable → *View memory* opens a live hex+ASCII dump at
