@@ -7,6 +7,7 @@ using System.Windows;
 using System.Windows.Input;
 using System.Windows.Media;
 using ClarionDbg.Engine;
+using Clarion.SourceResolution;
 using Microsoft.Win32;
 
 namespace ClarionDbg.App;
@@ -22,12 +23,37 @@ public partial class MainWindow : Window
     string? _exePath;
     string? _curModule;
 
+    // Redirection/FileList-aware source resolution (Clarion.SourceResolution).
+    // Null when the EXE has no associated solution — we then fall back to the
+    // legacy directory search in ResolveSource.
+    ClarionSourceResolver? _srcResolver;
+
     // ---- multi-DLL: the EXE plus any sibling Clarion debug DLLs, and the source-module catalog ----
     sealed record LoadedImage(string Path, string Name, PeImage Pe, TswdInfo Info);
     readonly List<LoadedImage> _images = new();                                   // EXE first, then debug DLLs
     readonly Dictionary<string, (TswdInfo Info, string Image)> _modOwners = new(StringComparer.OrdinalIgnoreCase); // .clw -> owning blob
     readonly List<string> _moduleNames = new();                                   // every source module, EXE modules first
+    readonly List<ModuleItem> _moduleItems = new();                               // dropdown items: EXE group first, then each DLL, each sorted; DLL modules labelled
     readonly List<string> _siblingDlls = new();                                   // debug DLL paths to PreloadModule onto the session
+
+    /// <summary>A MODULE-dropdown entry. When the owning solution is known, modules
+    /// that are a project's own <c>Compile</c> source carry <see cref="Project"/> and
+    /// render bare at the top of the list; library/runtime modules render labelled with
+    /// their owning image (e.g. "ABERROR.CLW   [SchoolData.dll]").</summary>
+    sealed record ModuleItem(string Name, string Image, bool FromExe, string? Project = null)
+    {
+        /// <summary>The group header this item sits under: its project, else the library bucket.</summary>
+        public string GroupLabel => Project ?? "Library / runtime";
+
+        public override string ToString() =>
+            Project != null ? Name                      // your project source: clean, floated to top
+            : FromExe ? Name                            // library compiled into the EXE: no redundant label
+            : $"{Name}   [{Image}]";                    // library from a debug DLL: labelled
+    }
+
+    // module filename -> owning project name, from the solution's Compile items.
+    // Empty when no solution is associated (then modules group by image instead).
+    readonly Dictionary<string, string> _projectOfModule = new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>The TSWD blob that owns a source module (the EXE's, a DLL's, or the EXE as fallback).</summary>
     TswdInfo? InfoFor(string? module)
@@ -84,10 +110,10 @@ public partial class MainWindow : Window
     void BtnOpen_Click(object sender, RoutedEventArgs e)
     {
         var dlg = new OpenFileDialog { Filter = "Clarion debug EXE (*.exe)|*.exe" };
-        if (dlg.ShowDialog() == true) LoadExe(dlg.FileName);
+        if (dlg.ShowDialog() == true) LoadExe(dlg.FileName, interactive: true);
     }
 
-    void LoadExe(string path)
+    void LoadExe(string path, bool interactive = false)
     {
         try
         {
@@ -98,14 +124,28 @@ public partial class MainWindow : Window
             if (_info == null) { Log("No .cwdebug info — this EXE was not built in Debug mode (vid=full)."); return; }
 
             DiscoverImages(path);     // EXE + sibling Clarion debug DLLs -> _images / _modOwners / _moduleNames
+            InitSourceResolver(path, interactive); // redirection/FileList source resolution if an associated .sln is found
+            BuildModuleItems();       // dropdown items; project source floated to top (needs the resolver's solution)
 
             _suppressModuleEvent = true;
-            CmbModule.ItemsSource = _moduleNames.ToList();
+            CmbModule.ItemsSource = GroupedBy(_moduleItems.ToList(), nameof(ModuleItem.GroupLabel));
             _suppressModuleEvent = false;
 
-            _allProcs = _images.SelectMany(img => img.Info.Procedures
-                                   .Select(p => new ProcItem(p.Name, p.Rva, img.Info, img.Name)))
-                               .OrderBy(p => p.Name).ToList();
+            var procs = _images.SelectMany((img, idx) => img.Info.Procedures
+                                   .Select(p => new ProcItem(p.Name, p.Rva, img.Info, img.Name,
+                                                             fromExe: idx == 0, project: ProjectOfProc(img.Info, p.Rva))));
+            // Mirror the MODULE dropdown: with a solution, project source floats to the
+            // top grouped by project, then library/runtime grouped by image; otherwise
+            // EXE procs first, grouped per image. (BuildModuleItems populated _projectOfModule.)
+            _allProcs = (_srcResolver != null
+                ? procs.OrderBy(p => p.Project == null ? 1 : 0)
+                       .ThenBy(p => p.Project, StringComparer.OrdinalIgnoreCase)
+                       .ThenBy(p => p.Image, StringComparer.OrdinalIgnoreCase)
+                       .ThenBy(p => p.Name, StringComparer.OrdinalIgnoreCase)
+                : procs.OrderBy(p => p.FromExe ? 0 : 1)
+                       .ThenBy(p => p.Image, StringComparer.OrdinalIgnoreCase)
+                       .ThenBy(p => p.Name, StringComparer.OrdinalIgnoreCase)
+                ).ToList();
             BuildProcCategories();    // populate the kind pulldown (sets _procGroup = null)
             FilterProcs("");
             BuildSourceTypeIndex();   // read declared types from the .clw sources
@@ -119,7 +159,7 @@ public partial class MainWindow : Window
 
             // show the program's primary module
             string primary = !string.IsNullOrEmpty(_info.SourceFile) ? _info.SourceFile : _moduleNames.FirstOrDefault() ?? "";
-            CmbModule.SelectedItem = primary;     // triggers ShowModule
+            SelectModule(primary);     // triggers ShowModule via SelectionChanged
             if (_bps.Count == 0 && _info.ModuleCount == 1 && primary.Equals("dbgtest.clw", StringComparison.OrdinalIgnoreCase))
                 ToggleBreak(21);                  // demo breakpoint for the bundled sample
             Status($"Loaded {Path.GetFileName(path)}. Pick a module, set breakpoints, press Go.");
@@ -130,7 +170,7 @@ public partial class MainWindow : Window
     void CmbModule_SelectionChanged(object sender, System.Windows.Controls.SelectionChangedEventArgs e)
     {
         if (_suppressModuleEvent) return;
-        if (CmbModule.SelectedItem is string name) ShowModule(name);
+        if (CmbModule.SelectedItem is ModuleItem item) ShowModule(item.Name);
     }
 
     /// <summary>Build the image set and source-module catalog: the EXE (module 0) plus every sibling
@@ -139,7 +179,7 @@ public partial class MainWindow : Window
     /// discovers and attributes them at runtime). EXE modules win any name collision.</summary>
     void DiscoverImages(string exePath)
     {
-        _images.Clear(); _modOwners.Clear(); _moduleNames.Clear(); _siblingDlls.Clear();
+        _images.Clear(); _modOwners.Clear(); _moduleNames.Clear(); _moduleItems.Clear(); _siblingDlls.Clear();
         _images.Add(new LoadedImage(exePath, Path.GetFileName(exePath), _pe!, _info!));
 
         var dir = Path.GetDirectoryName(Path.GetFullPath(exePath));
@@ -163,6 +203,75 @@ public partial class MainWindow : Window
             foreach (var m in img.Info.Modules)
                 if (m.Lines.Count > 0 && _modOwners.TryAdd(m.Name, (img.Info, img.Name)))
                     _moduleNames.Add(m.Name);
+    }
+
+    /// <summary>Build the MODULE dropdown items. When a solution is associated, the
+    /// project's own source (its <c>Compile</c> items) floats to the top grouped by
+    /// project; library/runtime modules follow, grouped by image. With no solution it
+    /// falls back to EXE-first / per-image grouping. Run AFTER <see cref="InitSourceResolver"/>.</summary>
+    void BuildModuleItems()
+    {
+        _moduleItems.Clear();
+        _projectOfModule.Clear();
+
+        // Classify modules as project source via the solution's Compile items.
+        if (_srcResolver != null)
+            foreach (var proj in _srcResolver.Solution.Projects)
+                foreach (var ci in proj.CompileItems)
+                {
+                    var fn = Path.GetFileName(ci);
+                    if (!string.IsNullOrEmpty(fn)) _projectOfModule[fn] = proj.Name;
+                }
+
+        var items = new List<ModuleItem>();
+        for (int i = 0; i < _images.Count; i++)
+        {
+            var img = _images[i];
+            bool fromExe = i == 0;
+            foreach (var n in _moduleNames.Where(n => _modOwners.TryGetValue(n, out var o) &&
+                                  string.Equals(o.Image, img.Name, StringComparison.OrdinalIgnoreCase)))
+            {
+                _projectOfModule.TryGetValue(n, out var proj);   // null => library/runtime
+                items.Add(new ModuleItem(n, img.Name, fromExe, proj));
+            }
+        }
+
+        var ordered = _srcResolver != null
+            ? items.OrderBy(m => m.Project == null ? 1 : 0)                  // project source first
+                   .ThenBy(m => m.Project, StringComparer.OrdinalIgnoreCase) // grouped by project
+                   .ThenBy(m => m.Image, StringComparer.OrdinalIgnoreCase)   // then library grouped by image
+                   .ThenBy(m => m.Name, StringComparer.OrdinalIgnoreCase)
+            : items.OrderBy(m => m.FromExe ? 0 : 1)                          // no solution: EXE first
+                   .ThenBy(m => m.Image, StringComparer.OrdinalIgnoreCase)
+                   .ThenBy(m => m.Name, StringComparer.OrdinalIgnoreCase);
+
+        _moduleItems.AddRange(ordered);
+    }
+
+    /// <summary>Wrap a list in a view grouped by a property, so the ComboBox/ListBox
+    /// renders a non-selectable header per group (project, then "Library / runtime").
+    /// Source order is preserved, so groups appear in our project-first ordering.</summary>
+    static System.ComponentModel.ICollectionView GroupedBy(System.Collections.IEnumerable source, string property)
+    {
+        var cvs = new System.Windows.Data.CollectionViewSource { Source = source };
+        cvs.GroupDescriptions.Add(new System.Windows.Data.PropertyGroupDescription(property));
+        return cvs.View;
+    }
+
+    /// <summary>The project a procedure belongs to: map its RVA → owning module
+    /// (binary search) → project via the solution's Compile items. Null ⇒ library/runtime.</summary>
+    string? ProjectOfProc(TswdInfo info, uint rva)
+    {
+        var mod = info.Locate(rva)?.Module;
+        return mod != null && _projectOfModule.TryGetValue(mod, out var proj) ? proj : null;
+    }
+
+    /// <summary>Select a module in the dropdown by name. ModuleItem is a record
+    /// (value equality), so this matches the bound item regardless of its label.</summary>
+    void SelectModule(string? name)
+    {
+        CmbModule.SelectedItem = name == null ? null
+            : _moduleItems.FirstOrDefault(it => string.Equals(it.Name, name, StringComparison.OrdinalIgnoreCase));
     }
 
     void ShowModule(string moduleName)
@@ -190,8 +299,82 @@ public partial class MainWindow : Window
         @"C:\Clarion12\accessory\libsrc\win"
     };
 
+    /// <summary>Locate a .sln to drive redirection/FileList resolution: the EXE's
+    /// own directory first, then one above (the common project\bin\app.exe layout).</summary>
+    static string? FindSolutionFor(string exePath)
+    {
+        var dir = Path.GetDirectoryName(Path.GetFullPath(exePath));
+        foreach (var d in new[] { dir, Path.GetDirectoryName(dir) })
+        {
+            if (string.IsNullOrEmpty(d) || !Directory.Exists(d)) continue;
+            var slns = Directory.GetFiles(d, "*.sln");
+            if (slns.Length > 0) return slns[0];
+        }
+        return null;
+    }
+
+    /// <summary>Build the source resolver for this EXE. Order: a saved per-solution
+    /// association; else (when <paramref name="interactive"/>) the link dialog, which
+    /// persists the user's choice; else an in-memory auto-build from the most recent
+    /// installed Clarion version. Leaves <see cref="_srcResolver"/> null when there is
+    /// no .sln or no install, so ResolveSource falls back to the dir search.</summary>
+    void InitSourceResolver(string exePath, bool interactive)
+    {
+        _srcResolver = null;
+        try
+        {
+            var sln = FindSolutionFor(exePath);
+            if (sln == null) { Log("No .sln near the EXE — using legacy source search."); return; }
+
+            // 1. Saved association — silent, authoritative.
+            var resolver = ClarionSourceResolver.CreateFromAssociation(sln);
+
+            // 2. No association + user-initiated open → ask once, then persist.
+            if (resolver == null && interactive)
+            {
+                var dlg = new LinkSolutionWindow(sln, exePath) { Owner = this };
+                if (dlg.ShowDialog() == true && dlg.Version != null && dlg.Association != null)
+                {
+                    SolutionAssociationStore.Write(dlg.SolutionPath, dlg.Association);
+                    resolver = ClarionSourceResolver.Create(
+                        dlg.SolutionPath, dlg.Version, dlg.PropertiesFile, dlg.Association.ConfigurationOverride);
+                    Log($"Linked {Path.GetFileName(dlg.SolutionPath)} → {dlg.Version.Name}; saved {Path.GetFileName(SolutionAssociationStore.GetSidecarPath(dlg.SolutionPath))}.");
+                }
+            }
+
+            // 3. Fallback (non-interactive, or the user skipped): auto-pick newest install, don't persist.
+            if (resolver == null)
+            {
+                var install = ClarionInstallationDetector.GetMostRecentInstallation();
+                var version = install?.CompilerVersions.FirstOrDefault();
+                if (install == null || version == null)
+                {
+                    Log("No Clarion installation detected — using legacy source search.");
+                    return;
+                }
+                resolver = ClarionSourceResolver.Create(sln, version, install.PropertiesPath);
+                Log($"Using {version.Name} for {Path.GetFileName(sln)} (not saved).");
+            }
+
+            _srcResolver = resolver;
+            Log($"Source resolver: {Path.GetFileName(sln)} · {resolver.Version.Name} · config {resolver.Configuration} · {resolver.FileListCount} indexed file(s).");
+        }
+        catch (Exception ex)
+        {
+            Log("Source resolver init skipped: " + ex.Message);
+        }
+    }
+
     string? ResolveSource(string moduleName)
     {
+        // Preferred: redirection/FileList resolution via the associated solution.
+        if (_srcResolver != null)
+        {
+            var hit = _srcResolver.Resolve(moduleName);
+            if (hit != null && File.Exists(hit)) return hit;
+        }
+
+        // Fallback: the legacy directory search (EXE dir, parent, hardcoded libsrc).
         var dirs = new List<string>();
         if (_exePath != null)
         {
@@ -394,7 +577,7 @@ public partial class MainWindow : Window
         if (info.Module != null && info.Module != _curModule)
         {
             _suppressModuleEvent = true;
-            CmbModule.SelectedItem = info.Module;
+            SelectModule(info.Module);
             _suppressModuleEvent = false;
             ShowModule(info.Module);
         }
@@ -462,7 +645,7 @@ public partial class MainWindow : Window
         {
             if (f.Module != _curModule)
             {
-                _suppressModuleEvent = true; CmbModule.SelectedItem = f.Module; _suppressModuleEvent = false;
+                _suppressModuleEvent = true; SelectModule(f.Module); _suppressModuleEvent = false;
                 ShowModule(f.Module);
             }
             ClearCurrentLine();
@@ -517,7 +700,7 @@ public partial class MainWindow : Window
             };
         if (!string.IsNullOrWhiteSpace(text))
             items = items.Where(p => p.Name.Contains(text, StringComparison.OrdinalIgnoreCase));
-        LstProcs.ItemsSource = items.Take(1000).ToList();
+        LstProcs.ItemsSource = GroupedBy(items.Take(1000).ToList(), nameof(ProcItem.GroupLabel));
     }
 
     void TxtProcFilter_TextChanged(object sender, System.Windows.Controls.TextChangedEventArgs e)
@@ -573,7 +756,7 @@ public partial class MainWindow : Window
         if (l.Module != _curModule)
         {
             _suppressModuleEvent = true;
-            CmbModule.SelectedItem = l.Module;
+            SelectModule(l.Module);
             _suppressModuleEvent = false;
             ShowModule(l.Module);
         }
@@ -1233,9 +1416,19 @@ public sealed class ProcItem
     public string Group { get; }                // App, Runtime, or the owning class name (THISWINDOW, BROWSECLASS, …)
     public TswdInfo? Info { get; }              // the blob this proc came from (EXE or a DLL); null = EXE
     public string? Image { get; }               // owning image filename, for display
-    public ProcItem(string name, uint rva, TswdInfo? info = null, string? image = null)
-    { Name = name; Rva = rva; Info = info; Image = image; Group = GroupOf(name); }
-    public override string ToString() => $"{Name}  @0x{Rva:X}";
+    public bool FromExe { get; }                // true ⇒ from the main EXE (no label); false ⇒ a debug DLL
+    public string? Project { get; }             // owning project (via module→Compile item); null ⇒ library/runtime
+    public ProcItem(string name, uint rva, TswdInfo? info = null, string? image = null, bool fromExe = false, string? project = null)
+    { Name = name; Rva = rva; Info = info; Image = image; FromExe = fromExe; Project = project; Group = GroupOf(name); }
+    // Your project's procedures render bare and float to the top; library/runtime
+    // procedures from a debug DLL carry their owning image so they're distinguishable.
+    /// <summary>The group header this procedure sits under: its project, else the library bucket.</summary>
+    public string GroupLabel => Project ?? "Library / runtime";
+
+    public override string ToString() =>
+        Project != null ? $"{Name}  @0x{Rva:X}"
+        : FromExe ? $"{Name}  @0x{Rva:X}"
+        : $"{Name}  @0x{Rva:X}   [{Image}]";
 
     /// <summary>
     /// The procedure's group: <see cref="App"/> for a free procedure (NAME@F with no class, e.g.
