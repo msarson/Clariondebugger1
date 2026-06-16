@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Standalone Clarion source-resolution library. Ported from the VS Code
+    Clarion-Extension LSP. Deliberately dependency-pure: targets netstandard2.0,
+    uses only System.* (System.Xml.Linq for XML) and has ZERO debugger / WPF /
+    Win32 references. That purity is what keeps a future extraction to its own
+    repo + NuGet a mechanical lift rather than a rewrite — do not add a reference
+    to ClarionDbg.Engine or any UI type here.
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>netstandard2.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <RootNamespace>Clarion.SourceResolution</RootNamespace>
+    <AssemblyName>Clarion.SourceResolution</AssemblyName>
+  </PropertyGroup>
+
+</Project>

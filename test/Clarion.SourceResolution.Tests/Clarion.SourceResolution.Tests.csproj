@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Tests run on net8.0 ON PURPOSE: the debugger runs on net8, and the SlnHash
+    fixture must prove our literal port matches the Framework-era vector when
+    executed on the same runtime (where the built-in string.GetHashCode() would
+    NOT). Keep the fixture corpus (especially ported .red cases) here to lock
+    C# <-> TS parity with the extension.
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.11.1" />
+    <PackageReference Include="xunit" Version="2.9.2" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Clarion.SourceResolution\Clarion.SourceResolution.csproj" />
+  </ItemGroup>
+
+</Project>
