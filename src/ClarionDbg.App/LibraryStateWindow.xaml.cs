@@ -42,21 +42,23 @@ public partial class LibraryStateWindow : Window
         var s = _session();
         if (s == null) { Grid.ItemsSource = null; TxtStatus.Text = "Not debugging."; return; }
 
-        var (items, err) = s.ReadLibraryState();
+        // PROTOTYPE: the safe memory-read path (EVENT/THREAD/ERRORCODE) — reads the RTL's TLS-backed
+        // per-thread block directly, no getter calls, so it can't crash the runtime even inside TakeEvent.
+        var (items, err) = s.ReadLibraryStateMem();
         if (err != null) { Grid.ItemsSource = null; TxtStatus.Text = err; return; }
 
         var rows = items.Select(it => new LibRow
         {
-            Group = it.Group,
+            Group = "RTL state (live memory)",
             Name = it.Name,
-            Value = it.Ok ? Pretty(it) : "<unavailable>",
-            Ok = it.Ok,
+            Value = it.Value,
+            Ok = it.Resolved,
         }).ToList();
 
         var view = new ListCollectionView(rows);
         view.GroupDescriptions.Add(new PropertyGroupDescription(nameof(LibRow.Group)));
         Grid.ItemsSource = view;
-        TxtStatus.Text = $"Snapshot at the current stop — {rows.Count} values. Discarded on resume.";
+        TxtStatus.Text = $"Snapshot at the current stop ({rows.Count} values, read from memory). Discarded on resume.";
     }
 
     void Refresh_Click(object sender, RoutedEventArgs e) => RefreshNow();

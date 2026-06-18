@@ -75,6 +75,11 @@ internal static class Native
     [DllImport("kernel32.dll", SetLastError = true)]
     public static extern bool FlushInstructionCache(IntPtr h, IntPtr addr, int size);
 
+    // ThreadBasicInformation (class 0): the result's TebBaseAddress lets us read a thread's TLS slots
+    // straight from its TEB — used to read the Clarion RTL per-thread instance block without any calls.
+    [DllImport("ntdll.dll")]
+    public static extern int NtQueryInformationThread(IntPtr hThread, int infoClass, byte[] buf, int len, out int retLen);
+
     // Suspend / resume other threads during a function-evaluation hijack so only the eval thread runs.
     [DllImport("kernel32.dll", SetLastError = true)]
     public static extern uint SuspendThread(IntPtr hThread);

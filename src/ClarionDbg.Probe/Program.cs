@@ -34,6 +34,35 @@ if (args.Length >= 2 && args[0].Equals("imports", StringComparison.OrdinalIgnore
     return;
 }
 
+// disasmexport <pe> <ExportName>  — statically disassemble a named export (to inspect getter bodies).
+if (args.Length >= 3 && args[0].Equals("disasmexport", StringComparison.OrdinalIgnoreCase))
+{
+    var dpe = new PeImage(args[1]);
+    uint rva = args[2].StartsWith("0x", StringComparison.OrdinalIgnoreCase)
+        ? Convert.ToUInt32(args[2], 16)
+        : dpe.FindExportRva(args[2]);
+    if (rva == 0) { Console.WriteLine($"export {args[2]} not found"); return; }
+    int n = args.Length > 3 && int.TryParse(args[3], out var cnt) ? cnt : 12;
+    bool stopAtRet = args.Length <= 3;   // when an explicit count is given, don't stop early
+    long off = dpe.RvaToOffset(rva);
+    var code = dpe.Raw.AsSpan((int)off, n * 8 + 16).ToArray();
+    var reader = new Iced.Intel.ByteArrayCodeReader(code);
+    var decoder = Iced.Intel.Decoder.Create(32, reader);
+    decoder.IP = rva;
+    var fmt = new Iced.Intel.NasmFormatter();
+    var so = new Iced.Intel.StringOutput();
+    Console.WriteLine($"{args[2]} @ RVA 0x{rva:X}");
+    for (int i = 0; i < n && reader.CanReadByte; i++)
+    {
+        var insn = decoder.Decode();
+        if (insn.IsInvalid) break;
+        so.Reset(); fmt.Format(insn, so);
+        Console.WriteLine($"  0x{(uint)insn.IP:X6}  {so.ToStringAndReset()}");
+        if (stopAtRet && insn.Mnemonic == Iced.Intel.Mnemonic.Ret) break;
+    }
+    return;
+}
+
 string exe = args.Length > 0 ? args[0] : @"C:\ai\debuger\sample\dbgtest\dbgtest_dbg.exe";
 int bpLine = args.Length > 1 ? int.Parse(args[1]) : 21;
 
@@ -159,6 +188,27 @@ sess.Stopped += info2 =>
         Environment.SetEnvironmentVariable("CLARIONDBG_SETNEXT", null);   // clear first: ReportStop re-enters this handler
         bool ok = sess.SetNextStatement(info2.Module ?? "", snLine);
         Console.WriteLine($">>> SetNextStatement -> line {snLine}: {ok}");
+    }
+
+    if (Environment.GetEnvironmentVariable("CLARIONDBG_LIBMEM") == "1")
+    {
+        // Memory-read path runs inline (pure ReadProcessMemory, no worker/hijack needed).
+        var (mem, merr) = sess.ReadLibraryStateMem();
+        Console.WriteLine("\n=== Library State (memory-read) ===");
+        if (merr != null) Console.WriteLine("   error: " + merr);
+        else foreach (var it in mem) Console.WriteLine($"   {it.Name,-10} = {(it.Resolved ? it.Value : it.Value)}");
+        // Compare against the getters (ground truth) off-thread, then terminate.
+        new Thread(() =>
+        {
+            Thread.Sleep(150);
+            var (g, gerr) = sess.ReadLibraryState();
+            Console.WriteLine("\n=== Library State (getters, ground truth) ===");
+            if (gerr != null) Console.WriteLine("   error: " + gerr);
+            else foreach (var it in g.Where(x => x.Name is "EVENT" or "THREAD" or "ERRORCODE"))
+                Console.WriteLine($"   {it.Name,-10} = {it.Value}");
+            sess.Terminate();
+        }).Start();
+        return;
     }
 
     if (Environment.GetEnvironmentVariable("CLARIONDBG_LIBSTATE") == "1")
