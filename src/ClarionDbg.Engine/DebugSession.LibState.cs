@@ -115,8 +115,10 @@ public sealed partial class DebugSession
             {
                 uint rva = rt?.Pe?.FindExportRva(g.Export) ?? 0;
                 if (rt == null || rva == 0) { rows.Add(new(g.Group, g.Name, "<unavailable>", g.Kind, false)); continue; }
-                var (ok, eax) = CallGetter(hThread, tid, saved, rt.LoadBase + rva, g.Export);
-                string value = ok ? Render(g.Kind, eax) : "<unavailable>";
+                var (ok, eax, exCode) = CallGetter(hThread, tid, saved, rt.LoadBase + rva);
+                // Surface the fault code in the row (NOT via Log — the UI thread is blocked in
+                // ReadLibraryState waiting for us, so a Dispatcher-marshalled Log would deadlock).
+                string value = ok ? Render(g.Kind, eax) : $"<unavailable: 0x{exCode:X8}>";
                 // Name a recognised event from the static equate table (no runtime call — see ClarionEvents).
                 // eax==0 means no event pending, so leave it as just the number.
                 if (ok && g.Name == "EVENT" && eax != 0 && ClarionEvents.Name(eax) is { } nm)
@@ -138,9 +140,9 @@ public sealed partial class DebugSession
     /// currently-held debug event on <paramref name="tid"/>, pumps until the helper RETs into the unmapped
     /// trap (success → read EAX) or ANY OTHER exception fires on that thread (the getter faulted → swallow
     /// it, never deliver to the app). Restores <paramref name="saved"/> either way and leaves the held
-    /// trap/fault event un-acked. <paramref name="label"/> is logged on fault so a getter that trips the
-    /// RTL fatal (0x6BEF5E4C) can be identified. Returns (ok, eax); ok=false means it faulted.</summary>
-    (bool ok, uint eax) CallGetter(IntPtr hThread, uint tid, Native.CONTEXT saved, uint fnVa, string label)
+    /// trap/fault event un-acked. Returns (ok, eax, exCode); ok=false means it faulted (exCode = the
+    /// exception code, e.g. 0x6BEF5E4C). Never logs — the caller's UI thread is blocked waiting on us.</summary>
+    (bool ok, uint eax, uint exCode) CallGetter(IntPtr hThread, uint tid, Native.CONTEXT saved, uint fnVa)
     {
         var e = saved;                                        // start from the genuine registers
         e.Esp = saved.Esp - 4;
@@ -163,17 +165,16 @@ public sealed partial class DebugSession
                 {
                     uint retEax = GetCtx(hThread).Eax;
                     Native.SetThreadContext(hThread, ref saved);  // restore; deliberately leave this event un-acked
-                    return (true, retEax);
+                    return (true, retEax, 0);
                 }
-                uint exCode = U32(buf, 12);                   // the getter faulted — log which one, then swallow it
-                Log?.Invoke($"Library State: {label} faulted (exception 0x{exCode:X8}) — value skipped.");
+                uint exCode = U32(buf, 12);                   // the getter faulted — surface the code, swallow it
                 Native.SetThreadContext(hThread, ref saved);
-                return (false, 0);
+                return (false, 0, exCode);
             }
             Native.ContinueDebugEvent(_pid, etid, Native.DBG_CONTINUE);   // unrelated event on another thread — pass through
         }
         try { Native.SetThreadContext(hThread, ref saved); } catch { }
-        return (false, 0);
+        return (false, 0, 0);
     }
 
     string Render(LibKind kind, uint eax) => kind switch
