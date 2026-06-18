@@ -70,11 +70,6 @@ internal static class Native
     [DllImport("kernel32.dll", SetLastError = true)]
     public static extern bool FlushInstructionCache(IntPtr h, IntPtr addr, int size);
 
-    // A scratch buffer in the debuggee for func-eval calls that take an output-string pointer
-    // (e.g. WslDebug$NameMessage). MEM_COMMIT|MEM_RESERVE = 0x3000, PAGE_READWRITE = 0x04.
-    [DllImport("kernel32.dll", SetLastError = true)]
-    public static extern IntPtr VirtualAllocEx(IntPtr h, IntPtr addr, uint size, uint type, uint protect);
-
     // Suspend / resume other threads during a function-evaluation hijack so only the eval thread runs.
     [DllImport("kernel32.dll", SetLastError = true)]
     public static extern uint SuspendThread(IntPtr hThread);
