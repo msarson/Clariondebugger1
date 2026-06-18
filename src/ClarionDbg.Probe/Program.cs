@@ -192,71 +192,12 @@ sess.Stopped += info2 =>
 
     if (Environment.GetEnvironmentVariable("CLARIONDBG_LIBEMU") == "1")
     {
-        var pairs = new (string Name, string Export)[]
-        {
-            ("EVENT","Cla$EVENT"), ("ACCEPTED","Cla$ACCEPTED"), ("FIELD","Cla$FIELD"), ("FOCUS","Cla$FOCUS"),
-            ("FIRSTFIELD","Cla$FIRSTFIELD"), ("LASTFIELD","Cla$LASTFIELD"), ("KEYCODE","Cla$KEYCODE"),
-            ("KEYCHAR","Cla$KEYCHAR"), ("KEYSTATE","Cla$KEYSTATE"), ("THREAD","Cla$THREAD"),
-            ("RUNCODE","Cla$RUNCODE"), ("REJECTCODE","Cla$REJECTCODE"), ("SELECTED","Cla$SELECTED"),
-            ("GETEXITCODE","Cla$GETEXITCODE"), ("ERRORCODE","Cla$ERRORCODE"),
-        };
-        var (full, _) = sess.ReadLibraryStateEmu();
-        Console.WriteLine("[emu-full] " + string.Join(" ", full.Select(it => $"{it.Name}={it.Value}")));
-        var emu = pairs.ToDictionary(p => p.Name, p => sess.EmulateGetter(p.Export));
-        new Thread(() =>
-        {
-            Thread.Sleep(150);
-            var (g, gerr) = sess.ReadLibraryState();   // getters = ground truth
-            var truth = gerr != null ? new() : g.ToDictionary(x => x.Name, x => x.Value);
-            Console.WriteLine("\n=== emulated vs getter (ground truth) ===");
-            foreach (var (name, _) in pairs)
-            {
-                string e = emu[name] is uint v ? ((int)v).ToString() : "<unsupported>";
-                truth.TryGetValue(name, out var t);
-                string mark = (t != null && t.StartsWith(e)) || e == t ? "OK" : "DIFF";
-                Console.WriteLine($"   {name,-12} emu={e,-12} getter={t,-12} {(e == "<unsupported>" ? "" : mark)}");
-            }
-            sess.Terminate();
-        }).Start();
-        return;
-    }
-
-    if (Environment.GetEnvironmentVariable("CLARIONDBG_LIBMEM") == "1")
-    {
-        // Memory-read path runs inline (pure ReadProcessMemory, no worker/hijack needed).
-        var (mem, merr) = sess.ReadLibraryStateMem();
-        Console.WriteLine("\n=== Library State (memory-read) ===");
-        if (merr != null) Console.WriteLine("   error: " + merr);
-        else foreach (var it in mem) Console.WriteLine($"   {it.Name,-10} = {(it.Resolved ? it.Value : it.Value)}");
-        // Compare against the getters (ground truth) off-thread, then terminate.
-        new Thread(() =>
-        {
-            Thread.Sleep(150);
-            var (g, gerr) = sess.ReadLibraryState();
-            Console.WriteLine("\n=== Library State (getters, ground truth) ===");
-            if (gerr != null) Console.WriteLine("   error: " + gerr);
-            else foreach (var it in g.Where(x => x.Name is "EVENT" or "THREAD" or "ERRORCODE"))
-                Console.WriteLine($"   {it.Name,-10} = {it.Value}");
-            sess.Terminate();
-        }).Start();
-        return;
-    }
-
-    if (Environment.GetEnvironmentVariable("CLARIONDBG_LIBSTATE") == "1")
-    {
-        Environment.SetEnvironmentVariable("CLARIONDBG_LIBSTATE", null);   // once
-        // Run off-thread: ReadLibraryState marshals to the parked worker (as the UI thread would).
-        // Returning here without resuming lets the worker park in Stop() so the eval can run.
-        new Thread(() =>
-        {
-            Thread.Sleep(200);   // let the worker reach Stop()'s wait loop and arm _canEval
-            var (items, err) = sess.ReadLibraryState();
-            Console.WriteLine("\n=== Library State ===");
-            if (err != null) Console.WriteLine("   error: " + err);
-            else foreach (var it in items)
-                Console.WriteLine($"   [{it.Group}] {it.Name,-13} = {(it.Ok ? it.Value : "<unavailable>")}");
-            sess.Terminate();
-        }).Start();
+        // Dump the emulated Library State (read-only; safe to call inline here while stopped).
+        var (items, err) = sess.ReadLibraryStateEmu();
+        Console.WriteLine("\n=== Library State (emulated) ===");
+        if (err != null) Console.WriteLine("   error: " + err);
+        else foreach (var it in items) Console.WriteLine($"   [{it.Group}] {it.Name,-13} = {(it.Ok ? it.Value : "<unavailable>")}");
+        sess.Terminate();
         return;
     }
 
