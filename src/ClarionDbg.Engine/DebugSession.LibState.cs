@@ -111,12 +111,24 @@ public sealed partial class DebugSession
                 if (kv.Key != tid && Native.SuspendThread(kv.Value) != 0xFFFFFFFF) suspended.Add(kv.Value);
 
             var rt = RuntimeModule();
+            // WslDebug$NameMessage turns an event number into its EVENT:* name (see debuger.clw). 0 if the
+            // runtime predates it — then EVENT shows just the number.
+            uint wslRva = rt?.Pe?.FindExportRva("WslDebug$NameMessage") ?? 0;
+            uint wslVa = (rt != null && wslRva != 0) ? rt.LoadBase + wslRva : 0;
+
             foreach (var g in Getters)
             {
                 uint rva = rt?.Pe?.FindExportRva(g.Export) ?? 0;
                 if (rt == null || rva == 0) { rows.Add(new(g.Group, g.Name, "<unavailable>", g.Kind, false)); continue; }
                 var (ok, eax) = CallGetter(hThread, tid, saved, rt.LoadBase + rva);
-                rows.Add(new(g.Group, g.Name, ok ? Render(g.Kind, eax) : "<unavailable>", g.Kind, ok));
+                string value = ok ? Render(g.Kind, eax) : "<unavailable>";
+                // Name a real, recognised event. eax==0 means no event pending; a "0x…" result is the
+                // resolver's fallback for an unmapped number — both are noise, so show just the number.
+                if (ok && g.Name == "EVENT" && eax != 0 && wslVa != 0
+                    && ResolveEventName(hThread, tid, saved, wslVa, eax) is { Length: > 0 } nm
+                    && !nm.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+                    value = $"{value}  ({nm})";
+                rows.Add(new(g.Group, g.Name, value, g.Kind, ok));
             }
             _libItems = rows;
         }
@@ -128,22 +140,30 @@ public sealed partial class DebugSession
         }
     }
 
-    /// <summary>One zero-arg getter call on the stopped thread. Preserves its REAL registers (only
-    /// EIP/ESP/TF change) so a getter that reads a context register sees genuine state. Continues the
-    /// currently-held debug event on <paramref name="tid"/>, pumps until the helper RETs into the
-    /// unmapped trap (success → read EAX) or ANY OTHER exception fires on that thread (the getter
-    /// faulted → swallow it, never deliver to the app). Restores <paramref name="saved"/> either way
-    /// and leaves the held trap/fault event un-acked. Returns (ok, eax); ok=false means it faulted.</summary>
     (bool ok, uint eax) CallGetter(IntPtr hThread, uint tid, Native.CONTEXT saved, uint fnVa)
+        => Hijack(hThread, tid, saved, fnVa);                 // a getter is a zero-arg call (regs preserved)
+
+    /// <summary>Call <paramref name="fnVa"/> on the stopped thread via the eval hijack. Starts from the
+    /// thread's REAL registers, optionally overriding EAX/EBX for the SoftVelocity register calling
+    /// convention these ClaRUN exports use (e.g. WslDebug$NameMessage: EAX=*CSTRING out, EBX=eventNum),
+    /// then sets EIP, pushes a fake return, and clears TF. Continues the held event on <paramref name="tid"/>
+    /// and pumps until the helper RETs into the unmapped trap (success → read EAX) or ANY OTHER exception
+    /// fires on that thread (the call faulted → swallow it, never deliver to the app). Restores
+    /// <paramref name="saved"/> either way and leaves the held trap/fault event un-acked. Returns (ok, eax);
+    /// ok=false means it faulted. With no EAX/EBX override every register is preserved, so a register-reading
+    /// getter sees genuine thread state.</summary>
+    (bool ok, uint eax) Hijack(IntPtr hThread, uint tid, Native.CONTEXT saved, uint fnVa, uint? eax = null, uint? ebx = null)
     {
         var e = saved;                                        // start from the genuine registers
         e.Esp = saved.Esp - 4;
         WriteDword(e.Esp, EVAL_TRAP_VA);                      // fake return → AV we recognise on RET
+        if (eax.HasValue) e.Eax = eax.Value;
+        if (ebx.HasValue) e.Ebx = ebx.Value;
         e.Eip = fnVa;
         e.EFlags &= ~0x100u;                                  // ensure trap flag is clear
         Native.SetThreadContext(hThread, ref e);
 
-        Native.ContinueDebugEvent(_pid, tid, Native.DBG_CONTINUE);   // release the held event; thread runs the getter
+        Native.ContinueDebugEvent(_pid, tid, Native.DBG_CONTINUE);   // release the held event; thread runs the call
 
         var buf = new byte[256];
         for (int guard = 0; guard < 100000; guard++)
@@ -153,14 +173,43 @@ public sealed partial class DebugSession
             if (code == Native.EXCEPTION_DEBUG_EVENT && etid == tid)
             {
                 uint exAddr = U32(buf, 24);
-                uint eax = GetCtx(hThread).Eax;
+                uint retEax = GetCtx(hThread).Eax;
                 Native.SetThreadContext(hThread, ref saved);  // restore; deliberately leave this event un-acked
-                return (exAddr == EVAL_TRAP_VA, exAddr == EVAL_TRAP_VA ? eax : 0u);
+                return (exAddr == EVAL_TRAP_VA, exAddr == EVAL_TRAP_VA ? retEax : 0u);
             }
             Native.ContinueDebugEvent(_pid, etid, Native.DBG_CONTINUE);   // unrelated event on another thread — pass through
         }
         try { Native.SetThreadContext(hThread, ref saved); } catch { }
         return (false, 0);
+    }
+
+    // Clarion EVENT codes are offset into the runtime's message-name space before lookup. C6+ (all
+    // versions this debugger targets) uses 0xA000; pre-C6 used 0x1400. See debuger.clw EventOffset.
+    const uint EventNameOffset = 0xA000;
+    uint _scratchVa;   // a 4 KB RW page in the debuggee, allocated lazily for output-buffer eval args
+
+    /// <summary>Resolve an event number to its EVENT:* name by calling ClaRUN's own WslDebug$NameMessage
+    /// (the resolver debuger.clw uses). Verified live: 0x203→EVENT:OpenWindow, 0x201→EVENT:CloseWindow,
+    /// 0x01→EVENT:Accepted. Returns "" if the scratch buffer can't be allocated or the call faults
+    /// (handled gracefully, never crashes the debuggee).</summary>
+    string ResolveEventName(IntPtr hThread, uint tid, Native.CONTEXT saved, uint wslVa, uint eventNum)
+    {
+        uint buf = ScratchBuffer();
+        if (buf == 0) return "";
+        WriteDword(buf, 0);   // clear first dword so an unwritten buffer reads as empty
+        // SoftVelocity register convention: EAX = output *CSTRING buffer, EBX = event number (offset
+        // into the runtime's message-name space). The name is written into the buffer (and returned in EAX).
+        var (ok, _) = Hijack(hThread, tid, saved, wslVa, eax: buf, ebx: eventNum + EventNameOffset);
+        return ok ? ReadAsciiZRemote(buf, 128) : "";
+    }
+
+    /// <summary>A reusable scratch page in the debuggee for eval calls that write to a buffer. Allocated
+    /// once per session (one page; not freed — negligible, and the process is the debuggee's). 0 on failure.</summary>
+    uint ScratchBuffer()
+    {
+        if (_scratchVa != 0) return _scratchVa;
+        var p = Native.VirtualAllocEx(_hProcess, IntPtr.Zero, 4096, 0x1000 | 0x2000, 0x04);   // COMMIT|RESERVE, RW
+        return _scratchVa = (uint)p.ToInt64();
     }
 
     string Render(LibKind kind, uint eax) => kind switch
